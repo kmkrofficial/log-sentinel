@@ -5,180 +5,328 @@ import torch
 from tqdm import tqdm
 from torch import nn
 import random
-from model import LogLLM
-from customDataset import CustomDataset
+from model import LogLLM # Assuming model.py is in the same directory or accessible
+from customDataset import CustomDataset # Assuming customDataset.py is accessible
 from torch import optim
+import gc # Garbage collector
+from transformers import get_linear_schedule_with_warmup # Import scheduler
 
 
-n_epochs_1 = 1
-n_epochs_2_1 = 1
-n_epochs_2_2 = 1
-n_epochs_3 = 2
-dataset_name = 'BGL'  # 'Thunderbird' 'HDFS_v1' 'BGL'   'Liberty'
-batch_size = 16
-micro_batch_size = 4
+# --- Hyperparameters and Configuration ---
+# Aggressive settings + MLP Projector focus
+n_epochs_1 = 2      # Llama LoRA only
+n_epochs_2_1 = 5    # Projector only (Keep increased focus)
+n_epochs_2_2 = 3    # Projector + BERT LoRA
+n_epochs_3 = 25     # All trainable (Keep significantly Increased)
+dataset_name = 'BGL'
+batch_size = 8
+micro_batch_size = 2
 gradient_accumulation_steps = batch_size // micro_batch_size
 
+# Learning Rates (Adjusted for MLP Projector focus)
+lr_1 = 5e-4         # Initial Llama LoRA tuning
+lr_2_1 = 1e-4         # Projector tuning (Keep higher LR for projector phase)
+lr_2_2 = 3e-5         # Projector + BERT LoRA tuning
+lr_3 = 1e-5         # Full model tuning (Keep very low)
 
-lr_1 = 5e-4
-lr_2_1 = 5e-4
-lr_2_2 = 5e-5
-lr_3 = 5e-5
 max_content_len = 100
 max_seq_len = 128
 
-data_path = r'/mnt/public/gw/SyslogData/{}/train.csv'.format(dataset_name)
+# Paths (Using user's paths)
+data_path = r'E:\research-stuff\LogLLM-3b\dataset\train.csv'
+Bert_path = r"E:\research-stuff\LogLLM-3b\models\bert-base-uncased"
+Llama_path = r"E:\research-stuff\LogLLM-3b\models\Llama-3.2-3B"
 
-min_less_portion = 0.3
-
-Bert_path = r"/mnt/public/gw/LLM_model/bert-base-uncased"
-Llama_path = r"/mnt/public/gw/LLM_model/Meta-Llama-3-8B"
-
-ROOT_DIR = Path(__file__).parent
+ROOT_DIR = Path(__file__).resolve().parent
 ft_path = os.path.join(ROOT_DIR, r"ft_model_{}".format(dataset_name))
 
-device = torch.device("cuda:0")
+# Skewed dataset handling (Force 50/50)
+min_less_portion = 0.5
 
-print(f'n_epochs_1: {n_epochs_1}\n'
-f'n_epochs_2_1: {n_epochs_2_1}\n'
-f'n_epochs_2_2: {n_epochs_2_2}\n'
-f'n_epochs_3: {n_epochs_3}\n'
-f'dataset_name: {dataset_name}\n'
-f'batch_size: {batch_size}\n'
-f'micro_batch_size: {micro_batch_size}\n'
-f'lr_1: {lr_1}\n'
-f'lr_2_1: {lr_2_1}\n'
-f'lr_2_2: {lr_2_2}\n'
-f'lr_3: {lr_3}\n'
-f'max_content_len: {max_content_len}\n'
-f'max_seq_len: {max_seq_len}\n'
-f'min_less_portion: {min_less_portion}\n'
-f'device: {device}')
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+print("--- Training Configuration (MLP Projector Attempt) ---")
+print(f'n_epochs_1 (Llama LoRA): {n_epochs_1}')
+print(f'n_epochs_2_1 (Projector): {n_epochs_2_1}')
+print(f'n_epochs_2_2 (Proj + BERT LoRA): {n_epochs_2_2}')
+print(f'n_epochs_3 (All Trainable): {n_epochs_3}')
+print(f'dataset_name: {dataset_name}')
+print(f'batch_size: {batch_size}')
+print(f'micro_batch_size: {micro_batch_size}')
+print(f'gradient_accumulation_steps: {gradient_accumulation_steps}')
+print(f'lr_1: {lr_1}')
+print(f'lr_2_1: {lr_2_1}')
+print(f'lr_2_2: {lr_2_2}')
+print(f'lr_3: {lr_3}')
+print(f'max_content_len: {max_content_len}')
+print(f'max_seq_len: {max_seq_len}')
+print(f'min_less_portion for oversampling: {min_less_portion}')
+print(f'Using device: {device}')
+print(f'Llama model path: {Llama_path}')
+print(f'BERT model path: {Bert_path}')
+print(f'Training data path: {data_path}')
+print(f'Fine-tuning save path: {ft_path}')
+print("-----------------------------")
 
 def print_number_of_trainable_model_parameters(model):
-    params = set()
+    # (Function remains the same)
     trainable_model_params = 0
     all_model_params = 0
-    for _, param in model.named_parameters():
+    trainable_param_set = set()
+    for name, param in model.named_parameters():
         all_model_params += param.numel()
         if param.requires_grad:
-            params.add(param)
             trainable_model_params += param.numel()
-    print(f"all params num: {all_model_params}, trainable param num: {trainable_model_params}")
-    return params
+            trainable_param_set.add(param)
+    print(f"Total model parameters: {all_model_params:,}")
+    print(f"Trainable model parameters: {trainable_model_params:,}")
+    print(f"Percentage trainable: {100 * trainable_model_params / all_model_params:.4f}%")
+    return trainable_param_set
 
 
-
-def trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs, lr,num_samples=None):
+def trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs, lr, num_samples=None):
+    """Trains the model for a given phase."""
+    model.train()
     criterion = nn.CrossEntropyLoss(reduction='mean')
 
+    print("\n--- Preparing Optimizer and Scheduler ---")
     trainable_model_params = print_number_of_trainable_model_parameters(model)
-    optimizer = torch.optim.AdamW(trainable_model_params, lr=lr)
-    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.7)
+    if not trainable_model_params:
+         print("Warning: No trainable parameters found for this training phase. Skipping.")
+         return
 
-    normal_tokens = model.Llama_tokenizer('The sequence is normal.')['input_ids']
-    anomalous_tokens = model.Llama_tokenizer('The sequence is anomalous.')['input_ids']
-    special_normal_tokens = set(normal_tokens) - set(anomalous_tokens)
-    special_anomalous_tokens = set(anomalous_tokens) - set(normal_tokens)
+    optimizer = torch.optim.AdamW(trainable_model_params, lr=lr, betas=(0.9, 0.98), eps=1e-9)
+    print(f"Optimizer: AdamW with lr={lr}")
 
-    indexes = [i for i in range(len(dataset))]
-    if dataset.num_less/len(dataset) < min_less_portion:
-        less_should_num = int((min_less_portion*dataset.num_majority) / (1 - min_less_portion))
-        add_num =  less_should_num - dataset.num_less
-        indexes = indexes + np.random.choice(dataset.less_indexes , add_num).tolist()
+    # --- Token analysis ---
+    # (Remains the same)
+    try:
+        target_phrase_normal = "The sequence is normal."
+        target_phrase_anomalous = "The sequence is anomalous."
+        normal_target_tokens = model.Llama_tokenizer(target_phrase_normal, add_special_tokens=True)['input_ids'][1:]
+        anomalous_target_tokens = model.Llama_tokenizer(target_phrase_anomalous, add_special_tokens=True)['input_ids'][1:]
+        special_normal_tokens = set(normal_target_tokens) - set(anomalous_target_tokens)
+        special_anomalous_tokens = set(anomalous_target_tokens) - set(normal_target_tokens)
+        print(f"Target 'normal' tokens (IDs): {normal_target_tokens}")
+        print(f"Target 'anomalous' tokens (IDs): {anomalous_target_tokens}")
+        print(f"Unique 'normal' target tokens: {special_normal_tokens}")
+        print(f"Unique 'anomalous' target tokens: {special_anomalous_tokens}")
+        acc_calc_tokens = special_normal_tokens.union(special_anomalous_tokens)
+        if not acc_calc_tokens: print("Warning: No unique target tokens found.")
+    except Exception as e:
+        print(f"Error getting unique tokens: {e}.")
+        acc_calc_tokens = set()
+    # --- End Token analysis ---
 
-    if num_samples is None:
-        total_steps = (len(indexes) * n_epochs) / micro_batch_size
-    else:
+    # --- Data Oversampling ---
+    # (Remains the same, using min_less_portion = 0.5)
+    indexes = list(range(len(dataset)))
+    original_size = len(indexes)
+    try:
+        num_less = dataset.num_less
+        num_majority = dataset.num_majority
+        less_indexes = dataset.less_indexes
+        if original_size == 0: less_portion = 0
+        else: less_portion = num_less / original_size
+        print(f"Dataset size: {original_size}, Minority class samples: {num_less} ({less_portion:.2%})")
+
+        if num_less > 0 and less_portion < min_less_portion:
+            print(f"Minority class proportion ({less_portion:.2%}) is less than target ({min_less_portion:.2%}). Oversampling...")
+            if num_majority == 0 and min_less_portion < 1.0:
+                 target_less_num = num_less
+            elif (1 - min_less_portion) == 0:
+                 target_less_num = int(1e9)
+            else:
+                 target_less_num = int((min_less_portion * num_majority) / (1 - min_less_portion))
+            add_num = max(0, target_less_num - num_less)
+            if add_num > 0:
+                print(f"Adding {add_num} samples from the minority class (Target proportion: {min_less_portion:.1%}).")
+                oversampled_indices = np.random.choice(less_indexes, add_num, replace=True).tolist()
+                indexes.extend(oversampled_indices)
+                print(f"Dataset size after oversampling: {len(indexes)}")
+            else: print("Calculated number of samples to add is zero or negative.")
+        else: print("Minority class proportion meets the target or no minority samples exist.")
+    except AttributeError as e:
+        print(f"Warning: Dataset object missing attributes for oversampling: {e}. Skipping.")
+    # --- End Data Oversampling ---
+
+    # --- Training Loop Setup ---
+    if num_samples is not None:
         num_samples = min(num_samples, len(indexes))
-        total_steps = (num_samples * n_epochs) / micro_batch_size
-    scheduler_step = int(total_steps/11)  #update 10 times lr
+        print(f"Training on a subset of {num_samples} samples per epoch.")
+        effective_len = num_samples
+    else:
+        effective_len = len(indexes)
 
-    print(f'scheduler_step: {scheduler_step}')
+    # --- Configure Scheduler ---
+    total_batches_per_epoch = (effective_len + micro_batch_size - 1) // micro_batch_size
+    total_optimization_steps = (total_batches_per_epoch * n_epochs + gradient_accumulation_steps -1) // gradient_accumulation_steps
+    num_warmup_steps = int(total_optimization_steps * 0.05) # 5% warmup
+    print(f"Total optimization steps: {total_optimization_steps}")
+    print(f"Warmup steps: {num_warmup_steps}")
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=total_optimization_steps
+    )
+    print(f"Scheduler: Linear warmup ({num_warmup_steps} steps) and decay")
+    print("--------------------------------------")
 
-    steps = 0
+    global_step = 0
     for epoch in range(int(n_epochs)):
-        total_acc, total_acc_count, total_count, train_loss = 0, 0, 0, 0
+        print(f"\n--- Epoch {epoch + 1}/{int(n_epochs)} ---")
+        model.train()
+        epoch_total_loss, epoch_processed_tokens = 0.0, 0
+        epoch_total_acc, epoch_total_acc_count = 0, 0
 
-        # 自定义的dataloader
-        random.shuffle(indexes)   # 打乱顺序
-        end = len(indexes) + 1
+        random.shuffle(indexes)
+        epoch_indexes = indexes[:effective_len]
+        optimizer.zero_grad()
+        pbar = tqdm(range(0, len(epoch_indexes), micro_batch_size), desc=f'Epoch {epoch + 1}', leave=False)
 
-        if num_samples is not None:
-            end = min(num_samples,end)
+        interval_loss, interval_tokens, interval_acc, interval_acc_count = 0.0, 0, 0, 0
+        log_interval = 200 # Log every 200 optimization steps
 
-        pbar = tqdm(range(micro_batch_size, end, micro_batch_size), desc='Epoch {}/{}'.format(epoch, n_epochs))
-        for i_th, bathc_i in enumerate(pbar):
-            steps += 1
+        for i_th, start_idx in enumerate(pbar):
+            end_idx = min(start_idx + micro_batch_size, len(epoch_indexes))
+            this_batch_indexes = epoch_indexes[start_idx:end_idx]
+            if not this_batch_indexes: continue
 
-            this_batch_indexes = indexes[bathc_i - micro_batch_size: bathc_i]
             this_batch_seqs, this_batch_labels = dataset.get_batch(this_batch_indexes)
 
-            outputs, targets = model.train_helper(this_batch_seqs, this_batch_labels)
+            # --- Batch Composition Logging ---
+            log_freq = gradient_accumulation_steps * 50 # Increase logging frequency
+            if global_step == 0 or (global_step > 0 and global_step % log_freq == 0):
+                try:
+                    if isinstance(this_batch_labels[0], str): num_anomalous = sum(1 for lbl in this_batch_labels if lbl == 'anomalous')
+                    else: num_anomalous = sum(1 for lbl in this_batch_labels if lbl == 1)
+                    num_normal = len(this_batch_labels) - num_anomalous
+                    print(f"\n  [Debug Step {global_step}] Micro-batch: Normal={num_normal}, Anomalous={num_anomalous}")
+                except Exception as log_e: print(f"\n [Debug Step {global_step}] Error logging batch composition: {log_e}")
+            # --- End Batch Composition Logging ---
 
-            loss = criterion(outputs, targets)
+            try:
+                outputs, targets = model.train_helper(this_batch_seqs, this_batch_labels)
+                if outputs.shape[0] == 0 or targets.shape[0] == 0: continue
+                loss = criterion(outputs, targets)
+                loss_val = loss.item()
+                loss = loss / gradient_accumulation_steps
+            except Exception as e:
+                 print(f"\nError FWD/Loss step {i_th} (Global {global_step}): {e}")
+                 continue
 
-            loss.backward()
-            # print(loss)
+            try:
+                 loss.backward()
+            except Exception as e:
+                 print(f"\nError BWD step {i_th} (Global {global_step}): {e}")
+                 optimizer.zero_grad()
+                 continue
 
-            if ((i_th + 1) % gradient_accumulation_steps) == 0:
-                # optimizer the net
-                optimizer.step()  # 更新网络参数
-                optimizer.zero_grad()  # reset grdient # 清空过往梯度
+            # Accumulate stats
+            epoch_total_loss += loss_val * targets.size(0)
+            epoch_processed_tokens += targets.size(0)
+            interval_loss += loss_val * targets.size(0)
+            interval_tokens += targets.size(0)
 
-            acc_mask = torch.zeros_like(targets,device=device).bool()
-            for token in special_normal_tokens.union(special_anomalous_tokens):
-                acc_mask[targets == token] = True
+            # --- Accuracy Calculation ---
+            if acc_calc_tokens and targets.numel() > 0:
+                with torch.no_grad():
+                    acc_mask = torch.zeros_like(targets, dtype=torch.bool, device=targets.device)
+                    for token_id in acc_calc_tokens: acc_mask |= (targets == token_id)
+                    num_relevant = acc_mask.sum().item()
+                    if num_relevant > 0:
+                        preds = outputs.argmax(dim=-1)[acc_mask].to(targets.device)
+                        correct = (preds == targets[acc_mask]).sum().item()
+                        epoch_total_acc += correct
+                        epoch_total_acc_count += num_relevant
+                        interval_acc += correct
+                        interval_acc_count += num_relevant
+            # --- End Accuracy ---
 
-            total_acc += (outputs.argmax(1)[acc_mask] == targets[acc_mask]).sum().item()
-            total_acc_count += acc_mask.sum()
-
-            train_loss += loss.item() * targets.size(0)
-
-            total_count += targets.size(0)
-
-            if steps % scheduler_step == 0:
+            # --- Optimizer Step ---
+            if (i_th + 1) % gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Gradient Clipping
+                optimizer.step()
                 scheduler.step()
-            pbar.set_postfix(lr=scheduler.get_last_lr()[0])
+                optimizer.zero_grad()
+                global_step += 1
 
-            if steps % 10000 ==0:   # every 10000 steps, print loss and acc
-                train_loss_epoch = train_loss / total_count
-                train_acc_epoch = total_acc / total_acc_count
-                print(f"[Epoch {epoch + 1:{len(str(n_epochs))}}/{n_epochs}] "
-                      f"[loss: {train_loss_epoch:3f}]"
-                      f"[acc: {train_acc_epoch:3f}]")
+                current_lr = optimizer.param_groups[0]['lr']
+                pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{current_lr:.2e}")
 
-                total_acc, total_acc_count, total_count, train_loss = 0, 0, 0, 0
+                # --- Periodic Logging ---
+                if global_step > 0 and global_step % log_interval == 0:
+                    avg_loss_interval = interval_loss / interval_tokens if interval_tokens > 0 else 0.0
+                    avg_acc_interval = interval_acc / interval_acc_count if interval_acc_count > 0 else 0.0
+                    print(f"\n  [Step {global_step}] Avg Loss (last {log_interval} steps): {avg_loss_interval:.4f}, Acc (unique tokens): {avg_acc_interval:.4f}, LR: {current_lr:.2e}")
+                    interval_loss, interval_tokens, interval_acc, interval_acc_count = 0.0, 0, 0, 0
 
-        if total_count > 0:
-            train_loss_epoch = train_loss / total_count
-            train_acc_epoch = total_acc / total_acc_count
-            print(f"[Epoch {epoch + 1:{len(str(n_epochs))}}/{n_epochs}] "
-                  f"[loss: {train_loss_epoch:3f}]"
-                  f"[acc: {train_acc_epoch:3f}]")
+        # --- End of Epoch ---
+        epoch_avg_loss = epoch_total_loss / epoch_processed_tokens if epoch_processed_tokens > 0 else 0.0
+        epoch_avg_acc = epoch_total_acc / epoch_total_acc_count if epoch_total_acc_count > 0 else 0.0
+        current_lr = optimizer.param_groups[0]['lr'] # Get LR at end of epoch
+        print(f"\n[Epoch {epoch + 1} Summary] Average Loss: {epoch_avg_loss:.4f}, Accuracy (on unique tokens): {epoch_avg_acc:.4f}, End LR: {current_lr:.2e}")
+
+        torch.cuda.empty_cache(); gc.collect()
+
+    print("\n--- Training Phase Complete ---")
+
 
 if __name__ == '__main__':
-    print(f'dataset: {data_path}')
+    print("--- Initializing Dataset and Model ---")
+    if not os.path.exists(data_path): raise FileNotFoundError(f"Training data not found: {data_path}")
+    if not os.path.exists(Bert_path): raise FileNotFoundError(f"BERT model not found: {Bert_path}")
+    if not os.path.exists(Llama_path): raise FileNotFoundError(f"Llama model not found: {Llama_path}")
+
     dataset = CustomDataset(data_path)
+    print(f"Dataset loaded: {len(dataset)} sequences.")
 
-    model = LogLLM(Bert_path, Llama_path, device = device, max_content_len = max_content_len, max_seq_len = max_seq_len)
-    # model = LogLLM(Bert_path, Llama_path, ft_path= ft_path, device = device, max_content_len = max_content_len, max_seq_len = max_seq_len)
+    load_existing_ft = False
+    effective_ft_path = None
+    llama_adapter_config = os.path.join(ft_path, 'Llama_ft', 'adapter_config.json')
+    projector_file = os.path.join(ft_path, 'projector.pt')
+    if load_existing_ft and os.path.exists(llama_adapter_config) and os.path.exists(projector_file):
+        print(f"Found existing fine-tuned model files at {ft_path}. Loading...")
+        effective_ft_path = ft_path
+    else:
+        if load_existing_ft: print(f"Existing fine-tuned model not found at {ft_path}. Initializing new model.")
+        else: print("load_existing_ft is False. Initializing new model.")
 
-    # phase 1
-    print("*" * 10 + "Start training Llama" + "*" * 10)
-    model.set_train_only_Llama()
-    trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs_1, lr_1, num_samples=1000)
-    # phase 2-1
-    print("*" * 10 + "Start training projector" + "*" * 10)
-    model.set_train_only_projector()
-    trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs_2_1, lr_2_1)
-    # phase 2-2
-    print("*" * 10 + "Start training projector and Bert" + "*" * 10)
-    model.set_train_projectorAndBert()
-    trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs_2_2, lr_2_2)
-    # phase 3
-    model.set_finetuning_all()
-    print("*" * 10 + "Start training entire model" + "*" * 10)
-    trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs_3, lr_3)
+    model = LogLLM(Bert_path, Llama_path, ft_path=effective_ft_path, is_train_mode=True, device=device,
+                   max_content_len=max_content_len, max_seq_len=max_seq_len)
+    print("Model initialized.")
 
+    # --- Training Phases ---
+    if n_epochs_1 > 0:
+        print("\n" + "*" * 10 + f" Phase 1: Training Llama LoRA ({n_epochs_1} epochs, LR={lr_1}) " + "*" * 10)
+        model.set_train_only_Llama()
+        trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs_1, lr_1)
+        torch.cuda.empty_cache(); gc.collect()
+    else: print("\nSkipping Phase 1")
+
+    if n_epochs_2_1 > 0:
+        print("\n" + "*" * 10 + f" Phase 2.1: Training Projector ({n_epochs_2_1} epochs, LR={lr_2_1}) " + "*" * 10)
+        model.set_train_only_projector()
+        trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs_2_1, lr_2_1)
+        torch.cuda.empty_cache(); gc.collect()
+    else: print("\nSkipping Phase 2.1")
+
+    if n_epochs_2_2 > 0:
+        print("\n" + "*" * 10 + f" Phase 2.2: Training Projector & BERT LoRA ({n_epochs_2_2} epochs, LR={lr_2_2}) " + "*" * 10)
+        model.set_train_projectorAndBert()
+        trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs_2_2, lr_2_2)
+        torch.cuda.empty_cache(); gc.collect()
+    else: print("\nSkipping Phase 2.2")
+
+    if n_epochs_3 > 0:
+        print("\n" + "*" * 10 + f" Phase 3: Training All Trainable ({n_epochs_3} epochs, LR={lr_3}) " + "*" * 10)
+        model.set_finetuning_all()
+        trainModel(model, dataset, micro_batch_size, gradient_accumulation_steps, n_epochs_3, lr_3)
+        torch.cuda.empty_cache(); gc.collect()
+    else: print("\nSkipping Phase 3")
+
+    # --- Save Final Model ---
+    print("\n--- Saving Final Fine-tuned Model ---")
     model.save_ft_model(ft_path)
+    print(f"Final model saved to: {ft_path}")
+    print("--- Training Script Finished ---")
