@@ -203,8 +203,8 @@ pyrightconfig.json
 .history
 .ionide
 
-/Llama-3.2-3b
-
-bgl2
+/models
+/dataset
+/.model-new-env
 
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks,visualstudiocode
