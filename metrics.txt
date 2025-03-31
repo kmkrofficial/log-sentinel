@@ -1,0 +1,107 @@
+PyNVML initialized successfully for GPU 0. GPU monitoring enabled.
+Plots will be saved to: E:\research-stuff\LogLLM-3b\visualizations
+--- Evaluation Configuration (Classification Head) ---
+dataset_name: BGL
+batch_size: 16
+max_content_len: 100
+max_seq_len: 128
+Using device: cuda:0
+Llama model path: E:\research-stuff\LogLLM-3b\models\Llama-3.2-3B
+BERT model path: E:\research-stuff\LogLLM-3b\models\bert-base-uncased
+Evaluation data path: E:\research-stuff\LogLLM-3b\dataset\test.csv
+Fine-tuned model path: E:\research-stuff\LogLLM-3b\ft_model_cls_BGL
+-----------------------------
+--- Initializing Dataset and Model for Evaluation ---
+Loading and preprocessing data from: E:\research-stuff\LogLLM-3b\dataset\test.csv
+Found 1932 normal samples and 68 anomalous samples.
+Minority class: Anomalous (68)
+Dataset initialized. Total sequences: 2000
+Evaluation dataset loaded: 2000 sequences.
+Warning: Llama tokenizer does not have a pad token. Setting to EOS token.
+Llama tokenizer pad token ID: 128001
+Loading Llama model with 8-bit quantization...
+Using compute dtype: torch.bfloat16
+Flash Attention 2 not available, using default SDPA.
+Loading checkpoint shards: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:01<00:00,  1.02it/s]
+Llama model loaded on device(s): cuda:0
+Loading BERT model...
+BERT model loaded on device: cuda:0
+Initializing MLP Projector and Classifier on device: cuda:0
+MLP Projector created with intermediate dim 3072, dtype torch.bfloat16
+Classification head created with output size 2, dtype torch.bfloat16
+Loading fine-tuned components from E:\research-stuff\LogLLM-3b\ft_model_cls_BGL.
+Llama PEFT adapters loaded.
+BERT PEFT model not found or base BERT already PEFT, using base BERT.
+Projector state dict loaded.
+Classifier state dict loaded.
+Model loaded for evaluation.
+
+--- Measuring baseline resource usage for 5 seconds ---
+Average Baseline CPU Usage: 0.00%
+Average Baseline GPU Utilization: 1.00%
+--- Baseline measurement finished ---
+GT labels are already numeric.
+First 10 GT labels (numeric): [0 0 1 0 0 1 0 0 0 0]
+
+--- Starting Evaluation on 2000 samples ---
+Evaluating Batches:   0%|                                                                                                                                                                         | 0/125 [00:00<?, ?it/s]E:\research-stuff\LogLLM-3b\.model-new-env\Lib\site-packages\bitsandbytes\autograd\_functions.py:315: UserWarning: MatMul8bitLt: inputs will be cast from torch.bfloat16 to float16 during quantization
+  warnings.warn(f"MatMul8bitLt: inputs will be cast from {A.dtype} to float16 during quantization")
+Evaluating Batches: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 125/125 [01:08<00:00,  1.81it/s]
+
+--- Processing Predictions ---
+
+--- Calculating Performance Metrics ---
+
+--- Ground Truth Distribution (Evaluated Samples) ---
+Anomalous sequences: 68
+Normal sequences:    1932
+
+--- Prediction Distribution (Evaluated Samples) ---
+Predicted anomalous: 67
+Predicted normal:    1933
+
+--- Confusion Matrix ---
+          Predicted Normal | Predicted Anomalous
+Actual Normal:      1921       |     11
+Actual Anomalous:     12       |     56
+
+--- Overall Metrics (Positive Class = Anomalous) ---
+Accuracy:  0.9885
+Precision: 0.8358
+Recall:    0.8235
+F1-Score:  0.8296
+
+--- Metrics Per Class ---
+Class 'Normal' (0):    Precision=0.9938, Recall=0.9943, F1=0.9940, Support=1932
+Class 'Anomalous' (1): Precision=0.8358, Recall=0.8235, F1=0.8296, Support=68
+--------------------------------------
+
+--- Performance & Resource Usage ---
+  Average per Batch:
+    Inference Time: 0.5506 seconds
+    CPU Usage:      105.36%
+    RAM Usage:      1616.05 MB
+    GPU Utilization:86.63%
+    GPU Memory Used:13251.99 MB
+
+  Peak/High Usage during Inference (Raw):
+    Peak CPU Usage:          189.40%
+    95th Percentile RAM Usage: 1647.35 MB
+    Peak GPU Utilization:    100.00%
+    95th Percentile GPU Mem: 14425.05 MB
+    95th Percentile Time:    1.2468 seconds
+
+  Adjusted Peak Usage (Inference Peak - Baseline Avg):
+    Adjusted Peak CPU Usage:      189.40%
+    Adjusted Peak GPU Utilization:99.00%
+--------------------------------------
+
+--- Generating Visualizations ---
+Confusion matrix saved to: E:\research-stuff\LogLLM-3b\visualizations\confusion_matrix_BGL.png
+Overall metrics plot saved to: E:\research-stuff\LogLLM-3b\visualizations\overall_metrics_BGL.png
+Per-class metrics plot saved to: E:\research-stuff\LogLLM-3b\visualizations\per_class_metrics_BGL.png
+Distribution comparison plot saved to: E:\research-stuff\LogLLM-3b\visualizations\distribution_comparison_BGL.png
+Inference time plot saved to: E:\research-stuff\LogLLM-3b\visualizations\inference_time_BGL.png
+Resource usage plot saved to: E:\research-stuff\LogLLM-3b\visualizations\resource_usage_BGL.png
+--------------------------------------
+PyNVML shut down successfully.
