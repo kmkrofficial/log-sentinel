@@ -208,4 +208,6 @@ pyrightconfig.json
 /.model-new-env
 /ft_model_*
 *.db
+/reports
+
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks,visualstudiocode

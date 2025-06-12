@@ -3,7 +3,8 @@ import pandas as pd
 import sys
 import os
 import json
-from contextlib import contextmanager
+import time
+import threading
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -12,136 +13,120 @@ from engine.training_controller import TrainingController
 from utils.database_manager import DatabaseManager
 from utils.model_loader import get_local_models
 from config import DEFAULT_HYPERPARAMETERS, DB_PATH, DATA_DIR
+# Import the new global state and lock
+from utils.global_state import APP_LOCK, TRAINING_STATUS
 
-class StreamlitLogCapture:
-    def __init__(self, container):
-        self.container = container
-        self.buffer = ""
-    def write(self, message):
-        self.buffer += message
-        self.container.text(self.buffer)
-    def flush(self): pass
-
-@contextmanager
-def st_capture_stdout(container):
-    original_stdout = sys.stdout
-    sys.stdout = StreamlitLogCapture(container)
-    try:
-        yield
-    finally:
-        sys.stdout = original_stdout
-
+# --- Helper Functions (Do not use Streamlit objects) ---
 def get_available_datasets():
     if not DATA_DIR.is_dir(): return []
     return [p.name for p in DATA_DIR.iterdir() if p.is_dir() and (p / 'train.csv').exists()]
 
+def training_callback(status):
+    with APP_LOCK:
+        TRAINING_STATUS["latest_progress"] = status
+        if TRAINING_STATUS["stop_requested"]: return 'STOP'
+    return 'CONTINUE'
+
+class ThreadLogRedirector:
+    def write(self, message):
+        if message.strip():
+            with APP_LOCK:
+                TRAINING_STATUS["log_buffer"].append(message.strip())
+    def flush(self): pass
+
+def run_training_in_thread(run_inputs):
+    original_stdout = sys.stdout
+    sys.stdout = ThreadLogRedirector()
+    db_manager = DatabaseManager(DB_PATH)
+    controller = TrainingController(
+        model_name=run_inputs['model_id'],
+        dataset_name=run_inputs['dataset'],
+        hyperparameters=json.loads(run_inputs['hp_json']),
+        db_manager=db_manager,
+        callback=training_callback
+    )
+    try:
+        controller.run()
+    except Exception as e:
+        print(f"CRITICAL ERROR IN THREAD: {e}")
+    finally:
+        sys.stdout = original_stdout
+        with APP_LOCK:
+            TRAINING_STATUS["is_running"] = False
+        db_manager.close()
+
+# --- UI Layout ---
 st.set_page_config(page_title="Train & Evaluate", layout="wide")
 st.title("🚀 Train & Evaluate a New Model")
 st.markdown("---")
 
-if 'stop_training' not in st.session_state:
-    st.session_state['stop_training'] = False
+with APP_LOCK:
+    is_training_globally = TRAINING_STATUS["is_running"]
+
+if is_training_globally:
+    st.info("A training run is already in progress application-wide. Please wait for it to complete.")
 
 col1, col2 = st.columns([1, 2])
-
 with col1:
     st.header("Configuration")
-    st.subheader("1. Select Model")
-    local_models = get_local_models()
-    hf_model_id = st.text_input("Enter Hugging Face Model ID", "princeton-nlp/Sheared-Llama-1.3B")
-    model_to_use = st.selectbox("Or choose a local model", [""] + local_models, index=0) or hf_model_id
-    st.info(f"**Model to be used:** `{model_to_use}`")
+    with st.form("training_form"):
+        st.subheader("1. Select Model")
+        local_models, hf_model_id = get_local_models(), st.text_input("Hugging Face Model ID", "princeton-nlp/Sheared-Llama-1.3B")
+        model_to_use = st.selectbox("Local model", [""] + local_models, index=0) or hf_model_id
+        
+        st.subheader("2. Select Dataset")
+        dataset_to_use = st.selectbox("Dataset", get_available_datasets(), index=0)
+        
+        st.subheader("3. Hyperparameters")
+        hp_json_str = st.text_area("JSON", json.dumps(DEFAULT_HYPERPARAMETERS, indent=4), height=300)
 
-    st.subheader("2. Select Dataset")
-    available_datasets = get_available_datasets()
-    if not available_datasets:
-        st.error("No datasets found in the `datasets` directory.")
-        dataset_to_use = None
-    else:
-        dataset_to_use = st.selectbox("Choose a dataset", available_datasets)
-    
-    # FIX: Use an editable JSON text area for hyperparameters.
-    st.subheader("3. Hyperparameters")
-    default_hp_str = json.dumps(DEFAULT_HYPERPARAMETERS, indent=4)
-    hp_json_str = st.text_area(
-        "Edit Hyperparameters as JSON",
-        value=default_hp_str,
-        height=300
-    )
-
-    st.markdown("---")
-    start_button = st.button("Start Training Run", disabled=(not model_to_use or not dataset_to_use), type="primary")
+        submitted = st.form_submit_button("Start Training Run", type="primary", disabled=is_training_globally)
+        if submitted:
+            try:
+                json.loads(hp_json_str)
+            except json.JSONDecodeError as e:
+                st.error(f"Invalid JSON: {e}")
+                st.stop()
+            
+            with APP_LOCK:
+                TRAINING_STATUS.update({"is_running": True, "stop_requested": False, "log_buffer": ["--- Starting new run... ---"], "latest_progress": {}})
+            
+            run_inputs = {"model_id": model_to_use, "dataset": dataset_to_use, "hp_json": hp_json_str}
+            thread = threading.Thread(target=run_training_in_thread, args=(run_inputs,), daemon=True)
+            thread.start()
+            st.rerun()
 
 with col2:
     st.header("Run Progress")
-    progress_area = st.empty()
-    
-    if start_button:
-        # Validate the JSON before proceeding
-        try:
-            edited_hp = json.loads(hp_json_str)
-        except json.JSONDecodeError as e:
-            st.error(f"Invalid JSON in hyperparameters: {e}")
-            st.stop() # Halt execution if JSON is invalid
+    if is_training_globally:
+        if st.button("Stop Run", type="secondary"):
+            with APP_LOCK:
+                TRAINING_STATUS["stop_requested"] = True
+            st.warning("Stop request sent. The run will abort after the current step.")
 
-        st.session_state['stop_training'] = False
+        with APP_LOCK:
+            progress_info = TRAINING_STATUS.get("latest_progress", {})
+            log_messages = TRAINING_STATUS.get("log_buffer", [])
         
-        with progress_area.container():
-            stop_button = st.button("Stop Run", type="secondary")
-            if stop_button:
-                st.session_state['stop_training'] = True
-                st.warning("Stop request sent. The run will abort after the current step.")
+        epoch, progress = progress_info.get("epoch", "Initializing..."), progress_info.get("progress", 0.0)
+        loss, etc = progress_info.get("loss", 0.0), progress_info.get("etc", 0)
+        
+        def format_time(s):
+            if s is None or s < 0: return "N/A"
+            h, rem = divmod(int(s), 3600)
+            m, s = divmod(rem, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}"
 
-            status_text = st.empty()
-            progress_bar = st.progress(0)
+        c1, c2 = st.columns(2)
+        c1.text(f"Current Phase: {epoch}")
+        c2.text(f"Est. Time Remaining: {format_time(etc)}")
+        st.progress(progress, text=f"Overall Progress: {progress:.1%} | Last Batch Loss: {loss:.4f}")
         
+        st.subheader("Live Console Log")
         log_container = st.container(height=500, border=True)
-        log_area = log_container.empty()
-        log_area.text("Logs will appear here when a run is started...")
-
-        def training_callback(status):
-            epoch = status.get("epoch", "Starting...")
-            progress = status.get("progress", 0.0)
-            loss = status.get("loss", 0.0)
-            
-            with progress_area.container():
-                 status_text.text(f"Current Phase: {epoch} | Last Batch Loss: {loss:.4f}")
-                 progress_bar.progress(progress, text=f"{progress:.0%}")
-
-            if st.session_state.get('stop_training', False):
-                return 'STOP'
-            return 'CONTINUE'
-
-        db_manager = DatabaseManager(DB_PATH)
-        controller = TrainingController(
-            model_name=model_to_use,
-            dataset_name=dataset_to_use,
-            hyperparameters=edited_hp, # Pass the validated, edited hyperparameters
-            db_manager=db_manager,
-            callback=training_callback
-        )
+        log_container.text("\n".join(log_messages))
         
-        if not controller.run_id:
-            st.error("Failed to create run. Check console for database errors.")
-        else:
-            st.session_state['run_id'] = controller.run_id
-            
-            with st_capture_stdout(log_area):
-                try:
-                    controller.run()
-                    with progress_area.container():
-                        if st.session_state.get('stop_training', False):
-                            st.warning(f"Run {st.session_state['run_id']} was aborted.")
-                        else:
-                            status_text.text("Completed!")
-                            progress_bar.progress(1.0, "Done!")
-                            st.success(f"Run {st.session_state['run_id']} completed successfully!")
-                            st.toast("✅ Training Complete!")
-
-                except Exception as e:
-                    print(f"CRITICAL ERROR in UI: {e}")
-                    st.error(f"Run {st.session_state['run_id']} failed: {e}")
-                    st.toast("❌ Training Failed!")
-        
-        db_manager.close()
-        st.session_state['stop_training'] = False
+        time.sleep(2)
+        st.rerun()
+    else:
+        st.info("Start a run to see live progress and logs.")
