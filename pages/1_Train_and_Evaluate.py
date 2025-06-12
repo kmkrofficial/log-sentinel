@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import sys
 import os
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -59,34 +60,14 @@ with col1:
     else:
         dataset_to_use = st.selectbox("Choose a dataset", available_datasets)
     
-    # FIX: Replace static JSON with interactive widgets inside an expander.
+    # FIX: Use an editable JSON text area for hyperparameters.
     st.subheader("3. Hyperparameters")
-    with st.expander("Edit Hyperparameters", expanded=False):
-        edited_hp = {}
-        
-        st.markdown("##### Epochs per Phase")
-        c1, c2 = st.columns(2)
-        edited_hp['n_epochs_phase1'] = c1.number_input("Phase 1 (Proj)", min_value=0, value=DEFAULT_HYPERPARAMETERS['n_epochs_phase1'])
-        edited_hp['n_epochs_phase2'] = c2.number_input("Phase 2 (Cls)", min_value=0, value=DEFAULT_HYPERPARAMETERS['n_epochs_phase2'])
-        edited_hp['n_epochs_phase3'] = c1.number_input("Phase 3 (Proj+Cls)", min_value=0, value=DEFAULT_HYPERPARAMETERS['n_epochs_phase3'])
-        edited_hp['n_epochs_phase4'] = c2.number_input("Phase 4 (All)", min_value=0, value=DEFAULT_HYPERPARAMETERS['n_epochs_phase4'])
-
-        st.markdown("##### Learning Rates per Phase")
-        c1, c2 = st.columns(2)
-        edited_hp['lr_phase1'] = c1.number_input("LR Phase 1", min_value=0.0, value=DEFAULT_HYPERPARAMETERS['lr_phase1'], format="%.0e")
-        edited_hp['lr_phase2'] = c2.number_input("LR Phase 2", min_value=0.0, value=DEFAULT_HYPERPARAMETERS['lr_phase2'], format="%.0e")
-        edited_hp['lr_phase3'] = c1.number_input("LR Phase 3", min_value=0.0, value=DEFAULT_HYPERPARAMETERS['lr_phase3'], format="%.0e")
-        edited_hp['lr_phase4'] = c2.number_input("LR Phase 4", min_value=0.0, value=DEFAULT_HYPERPARAMETERS['lr_phase4'], format="%.0e")
-        
-        st.markdown("##### Batch and Sequence Sizes")
-        c1, c2 = st.columns(2)
-        edited_hp['batch_size'] = c1.number_input("Effective Batch Size", min_value=1, value=DEFAULT_HYPERPARAMETERS['batch_size'])
-        edited_hp['micro_batch_size'] = c2.number_input("Micro Batch Size (per GPU pass)", min_value=1, value=DEFAULT_HYPERPARAMETERS['micro_batch_size'])
-        edited_hp['max_content_len'] = c1.number_input("Max Content Length", min_value=1, value=DEFAULT_HYPERPARAMETERS['max_content_len'])
-        edited_hp['max_seq_len'] = c2.number_input("Max Sequence Length", min_value=1, value=DEFAULT_HYPERPARAMETERS['max_seq_len'])
-        
-        st.markdown("##### Oversampling")
-        edited_hp['min_less_portion'] = st.slider("Minority Class Target Proportion", min_value=0.0, max_value=1.0, value=DEFAULT_HYPERPARAMETERS['min_less_portion'])
+    default_hp_str = json.dumps(DEFAULT_HYPERPARAMETERS, indent=4)
+    hp_json_str = st.text_area(
+        "Edit Hyperparameters as JSON",
+        value=default_hp_str,
+        height=300
+    )
 
     st.markdown("---")
     start_button = st.button("Start Training Run", disabled=(not model_to_use or not dataset_to_use), type="primary")
@@ -96,6 +77,13 @@ with col2:
     progress_area = st.empty()
     
     if start_button:
+        # Validate the JSON before proceeding
+        try:
+            edited_hp = json.loads(hp_json_str)
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid JSON in hyperparameters: {e}")
+            st.stop() # Halt execution if JSON is invalid
+
         st.session_state['stop_training'] = False
         
         with progress_area.container():
@@ -128,7 +116,7 @@ with col2:
         controller = TrainingController(
             model_name=model_to_use,
             dataset_name=dataset_to_use,
-            hyperparameters=edited_hp, # Pass the edited hyperparameters
+            hyperparameters=edited_hp, # Pass the validated, edited hyperparameters
             db_manager=db_manager,
             callback=training_callback
         )
