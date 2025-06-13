@@ -204,10 +204,12 @@ pyrightconfig.json
 .ionide
 
 /models
-/dataset
+/datasets
 /.model-new-env
 /ft_model_*
 *.db
 /reports
+/datasets
+
 
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks,visualstudiocode

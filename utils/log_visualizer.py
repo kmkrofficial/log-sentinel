@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 from pathlib import Path
+from sklearn.metrics import roc_curve, auc
 
 class LogVisualizer:
     def __init__(self, plot_dir):
@@ -10,7 +11,6 @@ class LogVisualizer:
         self.plot_paths = {}
 
     def _save_plot(self, fig, filename):
-        """Saves a matplotlib figure to the plot directory."""
         path = self.plot_dir / filename
         fig.tight_layout()
         fig.savefig(path)
@@ -19,21 +19,16 @@ class LogVisualizer:
         print(f"Saved plot: {path}")
 
     def plot_confusion_matrix(self, cm, class_names):
-        """Generates and saves a confusion matrix heatmap."""
         fig, ax = plt.subplots(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
-                    xticklabels=class_names, yticklabels=class_names)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, xticklabels=class_names, yticklabels=class_names)
         ax.set_xlabel('Predicted Label')
         ax.set_ylabel('True Label')
         ax.set_title('Confusion Matrix')
         self._save_plot(fig, 'confusion_matrix.png')
 
     def plot_overall_metrics(self, metrics):
-        """Generates and saves a bar chart for overall performance metrics."""
         fig, ax = plt.subplots(figsize=(8, 5))
-        names = list(metrics.keys())
-        values = list(metrics.values())
-        bars = ax.bar(names, values, color=['skyblue', 'lightcoral', 'lightgreen', 'gold'])
+        bars = ax.bar(metrics.keys(), metrics.values(), color=['skyblue', 'lightcoral', 'lightgreen', 'gold'])
         ax.set_ylabel('Score')
         ax.set_title('Overall Classification Metrics')
         ax.set_ylim(0, 1.1)
@@ -41,77 +36,64 @@ class LogVisualizer:
             yval = bar.get_height()
             ax.text(bar.get_x() + bar.get_width()/2.0, yval, f'{yval:.4f}', va='bottom', ha='center')
         self._save_plot(fig, 'overall_metrics.png')
-
-    def plot_per_class_metrics(self, metrics_per_class, class_names):
-        """Generates a grouped bar chart for per-class metrics."""
-        metric_types = ['Precision', 'Recall', 'F1-Score']
-        normal_metrics = metrics_per_class['normal']
-        anomalous_metrics = metrics_per_class['anomalous']
-        
-        x = np.arange(len(metric_types))
-        width = 0.35
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-        rects1 = ax.bar(x - width/2, [normal_metrics[m.lower()] for m in metric_types], width, label=class_names[0], color='cornflowerblue')
-        rects2 = ax.bar(x + width/2, [anomalous_metrics[m.lower()] for m in metric_types], width, label=class_names[1], color='salmon')
-
-        ax.set_ylabel('Score')
-        ax.set_title('Metrics per Class')
-        ax.set_xticks(x)
-        ax.set_xticklabels(metric_types)
-        ax.legend()
-        ax.set_ylim(0, 1.1)
-        self._save_plot(fig, 'per_class_metrics.png')
+    
+    def plot_roc_curve(self, y_true, y_pred_proba):
+        fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+        roc_auc = auc(fpr, tpr)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+        ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        ax.set_xlim([0.0, 1.0])
+        ax.set_ylim([0.0, 1.05])
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title('Receiver Operating Characteristic (ROC) Curve')
+        ax.legend(loc="lower right")
+        ax.grid(True)
+        self._save_plot(fig, 'roc_curve.png')
 
     def plot_resource_usage(self, resource_metrics):
-        """Plots CPU, RAM, and GPU usage over time."""
         ts_data = resource_metrics.get('time_series', {})
+        summary = resource_metrics.get('summary', {})
         timestamps = ts_data.get('timestamps')
-        if not timestamps:
-            print("No resource time-series data to plot.")
-            return
+        if not timestamps: return
 
-        has_gpu_data = 'gpu_util' in ts_data and any(v is not None for v in ts_data['gpu_util'])
-        num_subplots = 2 if has_gpu_data else 1
-        
-        fig, axs = plt.subplots(num_subplots, 1, figsize=(12, 6 * num_subplots), sharex=True)
-        
-        # Ensure axs is always a list for consistent indexing
-        if num_subplots == 1:
-            axs = [axs]
+        if 'cpu_usage_percent' in ts_data and ts_data['cpu_usage_percent']:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.plot(timestamps, ts_data['cpu_usage_percent'], color='tab:blue', label='CPU Usage (%)')
+            avg = summary.get('cpu', {}).get('avg_cpu_usage_percent', 0)
+            ax.axhline(y=avg, color='r', linestyle='--', label=f"Avg: {avg:.2f}%")
+            ax.set_ylabel('CPU Usage (%)'); ax.set_title('CPU Utilization Over Time')
+            ax.legend(); ax.grid(True); ax.set_xlabel('Time (seconds)')
+            self._save_plot(fig, 'cpu_usage.png')
 
-        # CPU and RAM Plot
-        ax_cpu = axs[0]
-        ax_cpu.plot(timestamps, ts_data.get('cpu_usage', []), color='tab:blue', label='CPU Usage (%)')
-        ax_cpu.set_ylabel('CPU Usage (%)', color='tab:blue')
-        ax_cpu.tick_params(axis='y', labelcolor='tab:blue')
-        ax_cpu.grid(True, axis='y')
+        if 'ram_usage_gb' in ts_data and ts_data['ram_usage_gb']:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.plot(timestamps, ts_data['ram_usage_gb'], color='tab:green', label='RAM Usage (GB)')
+            avg = summary.get('ram', {}).get('avg_ram_usage_gb', 0)
+            ax.axhline(y=avg, color='r', linestyle='--', label=f"Avg: {avg:.2f} GB")
+            ax.set_ylabel('RAM Usage (GB)'); ax.set_title('RAM Consumption Over Time')
+            ax.legend(); ax.grid(True); ax.set_xlabel('Time (seconds)')
+            self._save_plot(fig, 'ram_usage.png')
 
-        ax_ram = ax_cpu.twinx()
-        ax_ram.plot(timestamps, ts_data.get('ram_usage_mb', []), color='tab:green', label='RAM Usage (MB)')
-        ax_ram.set_ylabel('RAM Usage (MB)', color='tab:green')
-        ax_ram.tick_params(axis='y', labelcolor='tab:green')
-        ax_cpu.set_title('CPU and RAM Usage')
-        
-        # GPU Plot
-        if has_gpu_data:
-            ax_gpu = axs[1]
-            ax_gpu.plot(timestamps, ts_data.get('gpu_util', []), color='tab:red', label='GPU Utilization (%)')
-            ax_gpu.set_ylabel('GPU Utilization (%)', color='tab:red')
-            ax_gpu.tick_params(axis='y', labelcolor='tab:red')
-            ax_gpu.grid(True, axis='y')
-            
-            ax_gpu_mem = ax_gpu.twinx()
-            ax_gpu_mem.plot(timestamps, ts_data.get('gpu_mem_mb', []), color='tab:purple', label='GPU Memory (MB)')
-            ax_gpu_mem.set_ylabel('GPU Memory (MB)', color='tab:purple')
-            ax_gpu_mem.tick_params(axis='y', labelcolor='tab:purple')
-            ax_gpu.set_title('GPU Usage')
-            ax_gpu.set_xlabel('Time (seconds)')
-        else:
-            ax_cpu.set_xlabel('Time (seconds)')
+        if 'gpu' in summary:
+            if 'gpu_util_percent' in ts_data and any(v is not None for v in ts_data['gpu_util_percent']):
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.plot(timestamps, ts_data['gpu_util_percent'], color='tab:red', label='GPU Utilization (%)')
+                avg = summary.get('gpu', {}).get('avg_gpu_util_percent', 0)
+                ax.axhline(y=avg, color='b', linestyle='--', label=f"Avg: {avg:.2f}%")
+                ax.set_ylabel('GPU Utilization (%)'); ax.set_title('GPU Utilization Over Time')
+                ax.legend(); ax.grid(True); ax.set_xlabel('Time (seconds)')
+                self._save_plot(fig, 'gpu_utilization.png')
 
-        self._save_plot(fig, 'resource_usage.png')
+            if 'gpu_mem_used_gb' in ts_data and any(v is not None for v in ts_data['gpu_mem_used_gb']):
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.plot(timestamps, ts_data['gpu_mem_used_gb'], color='tab:purple', label='GPU Memory (GB)')
+                avg = summary.get('gpu', {}).get('avg_gpu_mem_gb', 0)
+                ax.axhline(y=avg, color='b', linestyle='--', label=f"Avg: {avg:.2f} GB")
+                ax.set_ylabel('GPU Memory (GB)'); ax.set_title('GPU Memory Consumption Over Time')
+                ax.legend(); ax.grid(True); ax.set_xlabel('Time (seconds)')
+                self._save_plot(fig, 'gpu_memory.png')
     
     def get_plot_paths(self):
-        """Returns a dictionary of all generated plot paths."""
         return self.plot_paths

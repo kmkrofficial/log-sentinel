@@ -2,8 +2,8 @@ import time
 import threading
 import psutil
 import statistics
+import numpy as np
 
-# Attempt to import pynvml for GPU monitoring
 try:
     import pynvml
     pynvml.nvmlInit()
@@ -13,58 +13,62 @@ except (ImportError, pynvml.NVMLError):
 
 class ResourceMonitor:
     def __init__(self, interval=1.0, gpu_index=0):
+        global GPU_MONITORING_AVAILABLE
+        
         self.interval = interval
         self.process = psutil.Process()
-
-        # Data storage
-        self.timestamps = []
-        self.cpu_usage = []
-        self.ram_usage_mb = []
-        self.gpu_util = []
-        self.gpu_mem_mb = []
-
+        self.cpu_count = psutil.cpu_count()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+
+        self.timestamps = []
+        self.cpu_usage_percent = []
+        self.ram_usage_gb = []
+        
+        self.gpu_util_percent = []
+        self.gpu_mem_used_gb = []
+        self.gpu_power_watts = []
+        self.gpu_clock_mhz = []
 
         self.gpu_handle = None
         if GPU_MONITORING_AVAILABLE:
             try:
                 self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
             except pynvml.NVMLError:
-                print(f"Warning: Could not get handle for GPU index {gpu_index}.")
+                print("Warning: Could not get GPU handle. GPU monitoring will be disabled for this session.")
                 self.gpu_handle = None
+                GPU_MONITORING_AVAILABLE = False
 
     def _monitor_loop(self):
-        """The internal loop that runs in a separate thread to collect metrics."""
-        self.process.cpu_percent(interval=None) # Initialize CPU measurement
-        
+        self.process.cpu_percent(interval=None)
         while not self._stop_event.is_set():
             self.timestamps.append(time.time())
             
-            # CPU and RAM
-            self.cpu_usage.append(self.process.cpu_percent(interval=None))
-            self.ram_usage_mb.append(self.process.memory_info().rss / (1024 * 1024))
-            
-            # GPU (if available)
+            self.cpu_usage_percent.append(self.process.cpu_percent(interval=None) / self.cpu_count)
+            self.ram_usage_gb.append(self.process.memory_info().rss / (1024 ** 3))
+
             if self.gpu_handle:
                 try:
-                    gpu_util_info = pynvml.nvmlDeviceGetUtilizationRates(self.gpu_handle)
-                    gpu_mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
-                    self.gpu_util.append(gpu_util_info.gpu)
-                    self.gpu_mem_mb.append(gpu_mem_info.used / (1024 * 1024))
+                    util_rates = pynvml.nvmlDeviceGetUtilizationRates(self.gpu_handle)
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
+                    
+                    self.gpu_util_percent.append(util_rates.gpu)
+                    self.gpu_mem_used_gb.append(mem_info.used / (1024 ** 3))
+                    self.gpu_power_watts.append(pynvml.nvmlDeviceGetPowerUsage(self.gpu_handle) / 1000.0)
+                    self.gpu_clock_mhz.append(pynvml.nvmlDeviceGetClockInfo(self.gpu_handle, pynvml.NVML_CLOCK_SM))
                 except pynvml.NVMLError:
-                    self.gpu_util.append(None)
-                    self.gpu_mem_mb.append(None)
-
+                    self.gpu_util_percent.append(None)
+                    self.gpu_mem_used_gb.append(None)
+                    self.gpu_power_watts.append(None)
+                    self.gpu_clock_mhz.append(None)
+            
             time.sleep(self.interval)
 
     def start(self):
-        """Starts the background monitoring thread."""
         print("Starting resource monitor...")
         self._thread.start()
 
     def stop(self):
-        """Stops the monitoring thread and returns the collected metrics."""
         if self._thread.is_alive():
             self._stop_event.set()
             self._thread.join()
@@ -72,41 +76,78 @@ class ResourceMonitor:
         return self.get_metrics()
         
     def get_metrics(self):
-        """
-        Processes and returns the collected metrics as a dictionary.
-        """
-        if not self.timestamps:
-            return {}
-
-        # Align timestamps to be relative to the start
+        if not self.timestamps: return {}
+        
         start_time = self.timestamps[0]
         relative_timestamps = [ts - start_time for ts in self.timestamps]
+        
+        vmem = psutil.virtual_memory()
+        total_system_ram_gb = vmem.total / (1024 ** 3)
+
+        cpu_summary = {
+            "avg_cpu_usage_percent": statistics.mean(self.cpu_usage_percent) if self.cpu_usage_percent else 0,
+            "p95_cpu_usage_percent": np.percentile(self.cpu_usage_percent, 95) if self.cpu_usage_percent else 0,
+            "utilized_cpu_time_sec": sum(self.process.cpu_times()),
+        }
+
+        ram_usage_percent = [(val / total_system_ram_gb) * 100 for val in self.ram_usage_gb]
+        ram_summary = {
+            "total_system_ram_gb": total_system_ram_gb,
+            "avg_ram_usage_gb": statistics.mean(self.ram_usage_gb) if self.ram_usage_gb else 0,
+            "p95_ram_usage_gb": np.percentile(self.ram_usage_gb, 95) if self.ram_usage_gb else 0,
+            "avg_ram_usage_percent": statistics.mean(ram_usage_percent) if ram_usage_percent else 0,
+            "p95_ram_usage_percent": np.percentile(ram_usage_percent, 95) if ram_usage_percent else 0
+        }
 
         metrics = {
             "time_series": {
                 "timestamps": relative_timestamps,
-                "cpu_usage": self.cpu_usage,
-                "ram_usage_mb": self.ram_usage_mb,
+                "cpu_usage_percent": self.cpu_usage_percent,
+                "ram_usage_gb": self.ram_usage_gb,
+                "ram_usage_percent": ram_usage_percent,
             },
             "summary": {
-                "avg_cpu_usage": statistics.mean(self.cpu_usage) if self.cpu_usage else 0,
-                "peak_cpu_usage": max(self.cpu_usage) if self.cpu_usage else 0,
-                "avg_ram_usage_mb": statistics.mean(self.ram_usage_mb) if self.ram_usage_mb else 0,
-                "peak_ram_usage_mb": max(self.ram_usage_mb) if self.ram_usage_mb else 0,
+                "cpu": cpu_summary,
+                "ram": ram_summary
             }
         }
 
         if self.gpu_handle:
-            valid_gpu_util = [v for v in self.gpu_util if v is not None]
-            valid_gpu_mem = [m for m in self.gpu_mem_mb if m is not None]
-            metrics["time_series"]["gpu_util"] = self.gpu_util
-            metrics["time_series"]["gpu_mem_mb"] = self.gpu_mem_mb
-            metrics["summary"].update({
-                "avg_gpu_util": statistics.mean(valid_gpu_util) if valid_gpu_util else 0,
-                "peak_gpu_util": max(valid_gpu_util) if valid_gpu_util else 0,
-                "avg_gpu_mem_mb": statistics.mean(valid_gpu_mem) if valid_gpu_mem else 0,
-                "peak_gpu_mem_mb": max(valid_gpu_mem) if valid_gpu_mem else 0,
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
+            total_gpu_mem_gb = mem_info.total / (1024 ** 3)
+            
+            valid_gpu_util = [v for v in self.gpu_util_percent if v is not None]
+            valid_gpu_mem_gb = [m for m in self.gpu_mem_used_gb if m is not None]
+            valid_gpu_power = [p for p in self.gpu_power_watts if p is not None]
+            valid_gpu_clock = [c for c in self.gpu_clock_mhz if c is not None]
+            
+            gpu_mem_usage_percent = [(val / total_gpu_mem_gb) * 100 for val in self.gpu_mem_used_gb if val is not None]
+
+            gpu_summary = {
+                "total_gpu_mem_gb": total_gpu_mem_gb,
+                "avg_gpu_util_percent": statistics.mean(valid_gpu_util) if valid_gpu_util else 0,
+                "p95_gpu_util_percent": np.percentile(valid_gpu_util, 95) if valid_gpu_util else 0,
+                "avg_gpu_mem_gb": statistics.mean(valid_gpu_mem_gb) if valid_gpu_mem_gb else 0,
+                "p95_gpu_mem_gb": np.percentile(valid_gpu_mem_gb, 95) if valid_gpu_mem_gb else 0,
+                "avg_gpu_mem_percent": statistics.mean(gpu_mem_usage_percent) if gpu_mem_usage_percent else 0,
+                "p95_gpu_mem_percent": np.percentile(gpu_mem_usage_percent, 95) if gpu_mem_usage_percent else 0,
+                "avg_power_watts": statistics.mean(valid_gpu_power) if valid_gpu_power else 0,
+                "p95_power_watts": np.percentile(valid_gpu_power, 95) if valid_gpu_power else 0,
+                "avg_clock_mhz": statistics.mean(valid_gpu_clock) if valid_gpu_clock else 0,
+            }
+
+            ts_gpu_mem_percent = []
+            if total_gpu_mem_gb > 0:
+                ts_gpu_mem_percent = [(v / total_gpu_mem_gb) * 100 if v is not None else None for v in self.gpu_mem_used_gb]
+
+            metrics["time_series"].update({
+                "gpu_util_percent": self.gpu_util_percent,
+                "gpu_mem_used_gb": self.gpu_mem_used_gb,
+                "gpu_mem_usage_percent": ts_gpu_mem_percent,
+                "gpu_power_watts": self.gpu_power_watts,
+                "gpu_clock_mhz": self.gpu_clock_mhz,
             })
+            metrics["summary"]["gpu"] = gpu_summary
 
         return metrics
 
@@ -115,4 +156,4 @@ class ResourceMonitor:
             try:
                 pynvml.nvmlShutdown()
             except pynvml.NVMLError:
-                pass # Ignore errors on shutdown
+                pass

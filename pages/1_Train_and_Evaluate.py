@@ -1,132 +1,145 @@
 import streamlit as st
 import pandas as pd
-import sys
+import threading
+import time
 import os
 import json
-import time
-import threading
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-from engine.training_controller import TrainingController
 from utils.database_manager import DatabaseManager
+from utils.global_state import GLOBAL_APP_STATE, APP_LOCK
+from engine.training_controller import TrainingController
+from config import DEFAULT_HYPERPARAMETERS, DATA_DIR, DB_PATH
 from utils.model_loader import get_local_models
-from config import DEFAULT_HYPERPARAMETERS, DB_PATH, DATA_DIR
-# Import the new global state and lock
-from utils.global_state import APP_LOCK, TRAINING_STATUS
 
-# --- Helper Functions (Do not use Streamlit objects) ---
+st.set_page_config(page_title="Train & Evaluate", page_icon="💪", layout="wide")
+
 def get_available_datasets():
     if not DATA_DIR.is_dir(): return []
-    return [p.name for p in DATA_DIR.iterdir() if p.is_dir() and (p / 'train.csv').exists()]
+    return [d.name for d in DATA_DIR.iterdir() if d.is_dir() and (d / 'train.csv').exists()]
 
-def training_callback(status):
+def format_time(seconds):
+    if seconds is None or not isinstance(seconds, (int, float)) or seconds < 0: return "Calculating..."
+    return time.strftime('%H:%M:%S', time.gmtime(seconds))
+
+def reset_global_state():
+    GLOBAL_APP_STATE["is_task_running"] = False
+    GLOBAL_APP_STATE["task_type"] = None
+    GLOBAL_APP_STATE["log_buffer"] = []
+    GLOBAL_APP_STATE["latest_progress"] = {}
+    GLOBAL_APP_STATE["stop_requested"] = False
+    GLOBAL_APP_STATE["result_buffer"] = None
+    GLOBAL_APP_STATE["error"] = None
+    GLOBAL_APP_STATE["done"] = False
+
+def callback_handler(data):
+    if GLOBAL_APP_STATE["stop_requested"]: return "STOP"
+    GLOBAL_APP_STATE["latest_progress"] = data
+    if "log" in data: GLOBAL_APP_STATE["log_buffer"].append(data["log"])
+    if "error" in data: GLOBAL_APP_STATE["error"] = data["error"]
+    return "CONTINUE"
+
+def run_training_in_thread(model_name, dataset_name, hyperparameters):
     with APP_LOCK:
-        TRAINING_STATUS["latest_progress"] = status
-        if TRAINING_STATUS["stop_requested"]: return 'STOP'
-    return 'CONTINUE'
+        if GLOBAL_APP_STATE.get("is_task_running"):
+            GLOBAL_APP_STATE["error"] = "Another task is already running."
+            return
+        reset_global_state()
+        GLOBAL_APP_STATE["is_task_running"] = True
+        GLOBAL_APP_STATE["task_type"] = "Training"
 
-class ThreadLogRedirector:
-    def write(self, message):
-        if message.strip():
-            with APP_LOCK:
-                TRAINING_STATUS["log_buffer"].append(message.strip())
-    def flush(self): pass
-
-def run_training_in_thread(run_inputs):
-    original_stdout = sys.stdout
-    sys.stdout = ThreadLogRedirector()
-    db_manager = DatabaseManager(DB_PATH)
+    db_manager = DatabaseManager(db_path=DB_PATH)
     controller = TrainingController(
-        model_name=run_inputs['model_id'],
-        dataset_name=run_inputs['dataset'],
-        hyperparameters=json.loads(run_inputs['hp_json']),
-        db_manager=db_manager,
-        callback=training_callback
+        model_name=model_name, dataset_name=dataset_name,
+        hyperparameters=hyperparameters, db_manager=db_manager,
+        callback=callback_handler
     )
     try:
         controller.run()
     except Exception as e:
-        print(f"CRITICAL ERROR IN THREAD: {e}")
+        print(f"Error during training thread: {e}")
+        GLOBAL_APP_STATE["error"] = str(e)
     finally:
-        sys.stdout = original_stdout
-        with APP_LOCK:
-            TRAINING_STATUS["is_running"] = False
+        with APP_LOCK: GLOBAL_APP_STATE["is_task_running"] = False
         db_manager.close()
+        GLOBAL_APP_STATE["done"] = True
 
-# --- UI Layout ---
-st.set_page_config(page_title="Train & Evaluate", layout="wide")
-st.title("🚀 Train & Evaluate a New Model")
+st.title("💪 Train & Evaluate a New Model")
 st.markdown("---")
 
-with APP_LOCK:
-    is_training_globally = TRAINING_STATUS["is_running"]
+is_any_task_running = GLOBAL_APP_STATE.get("is_task_running")
+if is_any_task_running:
+    st.warning(f"A '{GLOBAL_APP_STATE.get('task_type')}' task is currently running. All controls are disabled until it is complete.")
 
-if is_training_globally:
-    st.info("A training run is already in progress application-wide. Please wait for it to complete.")
+rerun_config = st.session_state.pop('rerun_config', None)
+col1, col2 = st.columns(2) # Changed to equal width columns
 
-col1, col2 = st.columns([1, 2])
 with col1:
-    st.header("Configuration")
-    with st.form("training_form"):
-        st.subheader("1. Select Model")
-        local_models, hf_model_id = get_local_models(), st.text_input("Hugging Face Model ID", "princeton-nlp/Sheared-Llama-1.3B")
-        model_to_use = st.selectbox("Local model", [""] + local_models, index=0) or hf_model_id
-        
-        st.subheader("2. Select Dataset")
-        dataset_to_use = st.selectbox("Dataset", get_available_datasets(), index=0)
-        
-        st.subheader("3. Hyperparameters")
-        hp_json_str = st.text_area("JSON", json.dumps(DEFAULT_HYPERPARAMETERS, indent=4), height=300)
+    st.header("Training Configuration")
+    st.subheader("1. Model Selection")
+    model_source = st.radio("Select Model Source", ["Hugging Face", "Local"], horizontal=True, index=1, disabled=is_any_task_running)
 
-        submitted = st.form_submit_button("Start Training Run", type="primary", disabled=is_training_globally)
-        if submitted:
-            try:
-                json.loads(hp_json_str)
-            except json.JSONDecodeError as e:
-                st.error(f"Invalid JSON: {e}")
-                st.stop()
-            
-            with APP_LOCK:
-                TRAINING_STATUS.update({"is_running": True, "stop_requested": False, "log_buffer": ["--- Starting new run... ---"], "latest_progress": {}})
-            
-            run_inputs = {"model_id": model_to_use, "dataset": dataset_to_use, "hp_json": hp_json_str}
-            thread = threading.Thread(target=run_training_in_thread, args=(run_inputs,), daemon=True)
-            thread.start()
-            st.rerun()
+    model_name_input = None
+    if model_source == "Hugging Face":
+        model_name_input = st.text_input("Enter Hugging Face Model ID", value="princeton-nlp/Sheared-Llama-1.3B", disabled=is_any_task_running)
+    else:
+        local_models = get_local_models()
+        if not local_models:
+            st.warning("No local models found in the `models/` directory.")
+            model_name_input = None
+        else:
+            model_name_input = st.selectbox("Select a Local Model", options=local_models, disabled=is_any_task_running)
+    
+    st.subheader("2. Dataset Selection")
+    available_datasets = get_available_datasets()
+    if not available_datasets:
+        st.error("No datasets found in the `datasets/` directory.")
+        st.stop()
+    dataset_index = 0
+    if rerun_config and rerun_config['dataset_name'] in available_datasets:
+        dataset_index = available_datasets.index(rerun_config['dataset_name'])
+    dataset_name_select = st.selectbox("Select Dataset", options=available_datasets, index=dataset_index, disabled=is_any_task_running)
+
+    st.subheader("3. Hyperparameters")
+    initial_hp = rerun_config['hyperparameters'] if rerun_config else DEFAULT_HYPERPARAMETERS
+    hp_json_str = json.dumps(initial_hp, indent=4)
+    hp_json_input = st.text_area("Edit Hyperparameters (JSON format)", value=hp_json_str, height=300, disabled=is_any_task_running)
+
+    st.subheader("4. Launch Run")
+    if st.button("🚀 Launch Training Run", type="primary", use_container_width=True, disabled=is_any_task_running):
+        try:
+            hyperparams_for_run = json.loads(hp_json_input)
+            if not model_name_input:
+                st.error("Model name cannot be empty. Please select or enter a model.")
+            else:
+                thread = threading.Thread(target=run_training_in_thread, args=(model_name_input, dataset_name_select, hyperparams_for_run))
+                thread.start()
+                st.rerun()
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid JSON in hyperparameters: {e}")
 
 with col2:
-    st.header("Run Progress")
-    if is_training_globally:
-        if st.button("Stop Run", type="secondary"):
-            with APP_LOCK:
-                TRAINING_STATUS["stop_requested"] = True
-            st.warning("Stop request sent. The run will abort after the current step.")
-
-        with APP_LOCK:
-            progress_info = TRAINING_STATUS.get("latest_progress", {})
-            log_messages = TRAINING_STATUS.get("log_buffer", [])
-        
-        epoch, progress = progress_info.get("epoch", "Initializing..."), progress_info.get("progress", 0.0)
-        loss, etc = progress_info.get("loss", 0.0), progress_info.get("etc", 0)
-        
-        def format_time(s):
-            if s is None or s < 0: return "N/A"
-            h, rem = divmod(int(s), 3600)
-            m, s = divmod(rem, 60)
-            return f"{h:02d}:{m:02d}:{s:02d}"
-
-        c1, c2 = st.columns(2)
-        c1.text(f"Current Phase: {epoch}")
-        c2.text(f"Est. Time Remaining: {format_time(etc)}")
-        st.progress(progress, text=f"Overall Progress: {progress:.1%} | Last Batch Loss: {loss:.4f}")
-        
-        st.subheader("Live Console Log")
-        log_container = st.container(height=500, border=True)
-        log_container.text("\n".join(log_messages))
-        
-        time.sleep(2)
+    st.header("Live Run Status")
+    is_this_task_running = is_any_task_running and GLOBAL_APP_STATE.get("task_type") == "Training"
+    if is_this_task_running:
+        progress_info = GLOBAL_APP_STATE.get("latest_progress", {})
+        epoch = progress_info.get("epoch", "Starting...")
+        progress = progress_info.get("progress", 0)
+        loss = progress_info.get("loss", 0)
+        etc = progress_info.get("etc", 0)
+        st.text(f"{progress:.1%}")
+        st.progress(progress)
+        st.text(f"Current Phase: {epoch}")
+        st.text(f"Batch Loss: {loss:.4f}")
+        st.text(f"ETC: {format_time(etc)}")
+        if st.button("Stop Training", use_container_width=True):
+            GLOBAL_APP_STATE["stop_requested"] = True
+            st.warning("Stop request sent.")
+        with st.expander("Show Live Logs", expanded=True):
+            st.code('\n'.join(GLOBAL_APP_STATE.get("log_buffer", [])), language='log', height=500)
+        if GLOBAL_APP_STATE.get("error"):
+            st.error(f"An error occurred: {GLOBAL_APP_STATE['error']}")
+        time.sleep(1)
         st.rerun()
     else:
-        st.info("Start a run to see live progress and logs.")
+        st.info("Status of the run will be displayed here once started.")
