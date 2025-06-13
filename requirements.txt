@@ -1,0 +1,15 @@
+streamlit
+torch
+transformers
+peft
+bitsandbytes
+accelerate
+pandas
+numpy
+scikit-learn
+psutil
+pynvml
+matplotlib
+seaborn
+tqdm
+fpdf2
