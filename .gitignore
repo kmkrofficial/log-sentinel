@@ -206,7 +206,7 @@ pyrightconfig.json
 /models
 /datasets
 /.model-new-env
-/ft_model_*
+/ft_model_* 
 *.db
 /reports
 /datasets

@@ -13,3 +13,5 @@ matplotlib
 seaborn
 tqdm
 fpdf2
+onnx
+onnxruntime

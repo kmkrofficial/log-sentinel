@@ -4,112 +4,182 @@ import pandas as pd
 import time
 import tempfile
 import gc
+import shutil
 import numpy as np
 from pathlib import Path
+from torch import nn
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, roc_curve, auc
 
-from config import REPORTS_DIR, DEFAULT_BERT_PATH
-from logsentinel_model import LogSentinelModel
-from utils.data_loader import replace_patterns
+from config import REPORTS_DIR, DEFAULT_BERT_PATH, MODELS_DIR
+from utils.data_loader import LogDataset, replace_patterns
+from utils.model_loader import load_model_and_tokenizer
+from utils.helpers import merge_data, stack_and_pad_left, safe_np_array
+from transformers import BertTokenizerFast, BertModel, AutoConfig
+from peft import PeftModel
 
 class InferenceController:
-    def __init__(self, run_id, callback=None):
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.run_id = run_id
-        self.model = None
+    def __init__(self, trained_run_id, db_manager, callback=None):
+        self.trained_run_id = trained_run_id
+        self.db = db_manager
         self.callback = callback or (lambda *args: 'CONTINUE')
-        
-        run_dir = REPORTS_DIR / self.run_id
-        self.model_path = run_dir / 'final_model'
-        self.model_name = self._get_model_name_from_run(run_id) 
-        if not self.model_path.exists() or not self.model_name:
-            raise FileNotFoundError(f"Fine-tuned model for run '{run_id}' not found.")
-        self._load_model()
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.run_id = None
+        self.trained_model_report_dir = REPORTS_DIR / self.trained_run_id
+        self.ft_path = self.trained_model_report_dir / 'final_model'
+        self.model_name = self._get_model_name_from_db(self.trained_run_id)
+        if not self.ft_path.exists() or not self.model_name:
+            raise FileNotFoundError(f"Fine-tuned model components not found for run '{self.trained_run_id}' in {self.ft_path}")
 
     def _log(self, message):
         print(message)
         self.callback({"log": message})
 
-    def _get_model_name_from_run(self, run_id):
-        from utils.database_manager import DatabaseManager
-        db = DatabaseManager(); details = db.get_run_details(run_id); db.close()
+    def _update_progress(self, processed, total, total_start_time):
+        if self.callback({"stop_requested": True}) == "STOP":
+            raise InterruptedError("Stop request received by controller.")
+        progress = processed / total if total > 0 else 0
+        elapsed_total = time.time() - total_start_time
+        etc = (elapsed_total / progress) * (1 - progress) if progress > 0 else 0
+        status = {"progress": progress, "rows_processed": processed, "etc": etc}
+        return self.callback(status)
+
+    def _get_model_name_from_db(self, run_id):
+        details = self.db.get_run_details(run_id)
         return details['run_info'].get('model_name') if details else None
 
-    def _load_model(self):
-        self._log(f"Loading fine-tuned model from {self.model_path}...")
-        self.model = LogSentinelModel(DEFAULT_BERT_PATH, self.model_name, str(self.model_path), False, self.device)
-        self.model.eval()
-        self._log("Model loaded in evaluation mode.")
-
-    def cleanup(self):
-        self._log("Cleaning up inference resources from memory...");
-        if hasattr(self, 'model') and self.model is not None: del self.model; self.model = None
-        gc.collect()
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-        self._log("Cleanup complete.")
-
-    def _preprocess_sequence(self, raw_sequence_str):
-        if not isinstance(raw_sequence_str, str): raw_sequence_str = str(raw_sequence_str)
-        processed_content = replace_patterns(raw_sequence_str)
-        return [line for line in processed_content.split(' ;-; ') if line]
-
-    def predict_single(self, raw_sequence_str):
-        if not self.model: raise RuntimeError("Model is not loaded.")
-        preprocessed_sequence = self._preprocess_sequence(raw_sequence_str)
-        with torch.no_grad():
-            logits = self.model([preprocessed_sequence])
-            prediction = torch.argmax(logits, dim=-1).item()
-        result = "Anomalous" if prediction == 1 else "Normal"
-        confidence = torch.softmax(logits, dim=-1)[0].max().item()
-        return {"prediction": result, "confidence": confidence}
-
-    def predict_batch(self, uploaded_file, internal_batch_size=32):
-        if not self.model: raise RuntimeError("Model is not loaded.")
+    def _run_bert_phase(self, dataset, temp_embedding_dir, batch_size):
+        self._log("Phase 1: Starting BERT embedding generation.")
+        bert_model = BertModel.from_pretrained(DEFAULT_BERT_PATH).to(self.device).eval()
+        bert_tokenizer = BertTokenizerFast.from_pretrained(DEFAULT_BERT_PATH)
+        llama_config = AutoConfig.from_pretrained(MODELS_DIR / self.model_name if (MODELS_DIR / self.model_name).exists() else self.model_name)
+        projector = nn.Sequential(nn.Linear(bert_model.config.hidden_size, llama_config.hidden_size), nn.GELU(), nn.Linear(llama_config.hidden_size, llama_config.hidden_size)).to(self.device).eval()
+        projector.load_state_dict(torch.load(os.path.join(self.ft_path, 'projector.pt')))
         
-        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.csv', encoding='utf-8') as tmp:
-            temp_file_path = tmp.name
-        self._log(f"Using true streaming. Output file: {temp_file_path}")
+        total_rows, num_batches, processed_rows = len(dataset), 0, 0
+        with torch.inference_mode():
+            for i in tqdm(range(0, total_rows, batch_size), desc="BERT Phase"):
+                end_idx = min(i + batch_size, total_rows)
+                seqs, _ = dataset.get_batch(list(range(i, end_idx)))
+                merged_logs, start_positions = merge_data(seqs)
+                if not merged_logs:
+                    processed_rows += len(seqs)
+                    continue
+                inputs = bert_tokenizer(merged_logs, return_tensors="pt", max_length=128, padding=True, truncation=True).to(self.device)
+                projected_outputs = projector(bert_model(**inputs).pooler_output)
+                torch.save({'data': projected_outputs.cpu(), 'pos': start_positions}, os.path.join(temp_embedding_dir, f"batch_{num_batches}.pt"))
+                num_batches += 1
+                processed_rows += len(seqs)
+                if self._update_progress(processed_rows, total_rows, self.run_start_time) == "STOP":
+                    raise InterruptedError("Stop request received.")
+        
+        del bert_model, projector, bert_tokenizer, llama_config; gc.collect(); torch.cuda.empty_cache()
+        self._log("Phase 1 Complete. BERT and Projector released from memory.")
+        return num_batches
 
-        uploaded_file.seek(0, os.SEEK_END); total_size = uploaded_file.tell(); uploaded_file.seek(0)
-        start_time = time.time(); rows_processed = 0
+    def _run_llama_phase(self, dataset, temp_embedding_dir, num_batches):
+        self._log("Phase 2: Starting Llama classification.")
+        llama_model, llama_tokenizer = load_model_and_tokenizer(self.model_name, is_train_mode=False)
+        llama_model = PeftModel.from_pretrained(llama_model, os.path.join(self.ft_path, 'Llama_ft'), is_trainable=False).eval()
+        classifier = nn.Linear(llama_model.config.hidden_size, 2).to(self.device).eval()
+        classifier.load_state_dict(torch.load(os.path.join(self.ft_path, 'classifier.pt')))
+        instruc_tokens = llama_tokenizer(['Below is a sequence of system log messages:'], return_tensors="pt", padding=True).to(self.device)
+        
+        all_preds, all_probas, processed_rows, total_rows = [], [], 0, len(dataset)
+        with torch.inference_mode():
+            for i in tqdm(range(num_batches), desc="Llama Phase"):
+                batch_data = torch.load(os.path.join(temp_embedding_dir, f"batch_{i}.pt"))
+                projected_outputs, start_positions = batch_data['data'].to(self.device), batch_data['pos']
+                if not start_positions: continue
+                
+                seq_embeddings = list(torch.tensor_split(projected_outputs, start_positions[1:], dim=0)) if len(start_positions) > 1 else [projected_outputs]
+                valid_embeddings = [torch.cat([llama_model.get_input_embeddings()(instruc_tokens['input_ids'])[0], se], dim=0) for se in seq_embeddings if se is not None and se.shape[0] > 0]
+                if not valid_embeddings:
+                    processed_rows += len(seq_embeddings)
+                    continue
+                
+                inputs_embeds, attention_mask = stack_and_pad_left(valid_embeddings)
+                outputs = llama_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
+                sequence_lengths = attention_mask.sum(dim=1) - 1
+                cls_input_hidden_state = outputs.hidden_states[-1][torch.arange(len(valid_embeddings), device=self.device), sequence_lengths]
+                probas = torch.softmax(classifier(cls_input_hidden_state), dim=-1)
+                all_preds.extend(torch.argmax(probas, dim=-1).cpu().numpy())
+                all_probas.extend(probas[:, 1].cpu().numpy())
+                
+                processed_rows += len(seq_embeddings)
+                if self._update_progress(processed_rows, total_rows, self.run_start_time) == "STOP":
+                    raise InterruptedError("Stop request received.")
+
+        del llama_model, classifier, llama_tokenizer; gc.collect(); torch.cuda.empty_cache()
+        self._log("Phase 2 Complete. Llama and Classifier released from memory.")
+        return all_preds, all_probas
+
+    def run(self, input_file_path: str, mode: str, internal_batch_size: int = 32):
+        from utils.resource_monitor import ResourceMonitor
+        from utils.log_visualizer import LogVisualizer
+
+        self.run_start_time = time.time()
+        run_type = 'Testing' if mode == 'testing' else 'Inference'
+        self.run_id = self.db.create_new_run(run_type, self.model_name, os.path.basename(input_file_path), {"mode": mode, "batch_size": internal_batch_size})
+        if not self.run_id: raise RuntimeError("Failed to create new run in the database.")
+        
+        report_dir = REPORTS_DIR / self.run_id
+        report_dir.mkdir(exist_ok=True)
+        visualizer = LogVisualizer(plot_dir=report_dir)
+        monitor = ResourceMonitor()
+        monitor.start()
+        
+        temp_embedding_dir = tempfile.mkdtemp()
+        final_status, results = 'FAILED', None
         
         try:
-            header = pd.read_csv(uploaded_file, nrows=0).columns.tolist()
-            if 'Content' not in header: raise ValueError("'Content' column not found in the input file.")
-        except Exception as e: self._log(f"Error reading CSV header: {e}"); raise
-        
-        uploaded_file.seek(0)
-        pd.DataFrame(columns=header + ['Prediction', 'Confidence']).to_csv(temp_file_path, index=False, mode='w')
-        
-        pd_iterator = pd.read_csv(uploaded_file, chunksize=internal_batch_size, iterator=True, low_memory=False)
+            dataset = LogDataset(input_file_path)
+            if mode == 'testing' and (dataset.labels == -1).all():
+                raise ValueError("Testing mode requires a 'Label' column, but it was missing or all values were invalid.")
 
-        for df_batch in pd_iterator:
-            sequences = [self._preprocess_sequence(row) for row in df_batch['Content']]
+            num_batches = self._run_bert_phase(dataset, temp_embedding_dir, internal_batch_size)
+            all_preds, all_probas = self._run_llama_phase(dataset, temp_embedding_dir, num_batches)
             
-            with torch.no_grad():
-                logits = self.model(sequences)
-                probas = torch.softmax(logits, dim=-1)
-                predictions = torch.argmax(probas, dim=-1).cpu().numpy()
-                confidences = probas.max(dim=-1).values.cpu().numpy()
+            total_run_time, total_records = time.time() - self.run_start_time, len(dataset)
+            time_per_record_ms = (total_run_time / total_records) * 1000 if total_records > 0 else 0
 
-            df_batch['Prediction'] = ["Anomalous" if p == 1 else "Normal" for p in predictions]
-            df_batch['Confidence'] = confidences
-            df_batch.to_csv(temp_file_path, mode='a', header=False, index=False)
+            # This block now handles both modes, creating a unified perf_metrics dict
+            perf_metrics = {
+                "overall": {
+                    "total_run_time_sec": total_run_time,
+                    "time_per_record_ms": time_per_record_ms
+                }
+            }
+            if mode == 'testing':
+                gt_labels = dataset.get_all_labels()
+                preds_numeric, probas_numeric, gt_numeric = safe_np_array(all_preds), safe_np_array(all_probas), gt_labels
+                p, r, f1, _ = precision_recall_fscore_support(gt_numeric, preds_numeric, average='binary', pos_label=1, zero_division=0)
+                perf_metrics["overall"].update({
+                    "accuracy": accuracy_score(gt_numeric, preds_numeric), "precision": p, "recall": r, "f1_score": f1
+                })
+                visualizer.plot_confusion_matrix(confusion_matrix(gt_numeric, preds_numeric), ['Normal', 'Anomalous'])
+                visualizer.plot_roc_curve(gt_numeric, probas_numeric)
+                visualizer.plot_overall_metrics({k: v for k, v in perf_metrics['overall'].items() if k in ['accuracy', 'precision', 'recall', 'f1_score']})
+            else:
+                df = pd.read_csv(input_file_path); df['Prediction'] = ["Anomalous" if p == 1 else "Normal" for p in all_preds]; df['Confidence'] = all_probas
+                output_csv_path = report_dir / f"inference_results_{self.run_id}.csv"; df.to_csv(output_csv_path, index=False)
+                results = str(output_csv_path)
+                perf_metrics["overall"]["total_rows"] = total_records
             
-            rows_processed += len(df_batch)
-            current_pos = uploaded_file.tell()
-            progress = current_pos / total_size if total_size > 0 else 1
-            elapsed = time.time() - start_time
-            etc = (elapsed / progress) * (1 - progress) if progress > 0 and progress < 1 else 0
-
-            if self.callback({"progress": progress, "rows_processed": rows_processed, "etc": etc}) == 'STOP':
-                self._log("Inference aborted by user."); os.remove(temp_file_path); return None, None
-        
-        total_time = time.time() - start_time
-        performance_metrics = {
-            "total_time_sec": total_time,
-            "time_per_prediction_ms": (total_time / rows_processed) * 1000 if rows_processed > 0 else 0,
-            "total_rows": rows_processed, 
-            "rows_per_second": rows_processed / total_time if total_time > 0 else float('inf')
-        }
-        
-        return temp_file_path, performance_metrics
+            self.db.save_performance_metrics(self.run_id, perf_metrics)
+            final_status = 'COMPLETED'
+        except InterruptedError:
+            final_status = 'ABORTED'; self._log(f"Run {self.run_id} aborted by user.")
+        except Exception as e:
+            final_status = 'FAILED'; error_msg = f"CRITICAL ERROR in run {self.run_id}: {e}"; print(error_msg); self._log(error_msg)
+            self.callback({"error": str(e)})
+        finally:
+            if os.path.exists(temp_embedding_dir): shutil.rmtree(temp_embedding_dir)
+            resource_metrics = monitor.stop()
+            if self.run_id:
+                self.db.save_resource_metrics(self.run_id, resource_metrics)
+                visualizer.plot_resource_usage(resource_metrics)
+                self.db.update_run_status(self.run_id, final_status, str(report_dir) if final_status == 'COMPLETED' else None)
+            
+            self._log(f"Run {self.run_id} finished with status: {final_status}")
+            self.callback({"status": final_status, "done": True, "result": results})

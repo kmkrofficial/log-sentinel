@@ -4,22 +4,23 @@ import psutil
 import statistics
 import numpy as np
 
+# We handle the library import and shutdown more robustly inside the class.
 try:
     import pynvml
-    pynvml.nvmlInit()
-    GPU_MONITORING_AVAILABLE = True
-except (ImportError, pynvml.NVMLError):
-    GPU_MONITORING_AVAILABLE = False
+    PYNML_AVAILABLE = True
+except ImportError:
+    PYNML_AVAILABLE = False
 
 class ResourceMonitor:
     def __init__(self, interval=1.0, gpu_index=0):
-        global GPU_MONITORING_AVAILABLE
-        
         self.interval = interval
+        self.gpu_index = gpu_index
         self.process = psutil.Process()
         self.cpu_count = psutil.cpu_count()
         self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread = None
+        self.gpu_handle = None
+        self.monitoring_active = False
 
         self.timestamps = []
         self.cpu_usage_percent = []
@@ -30,23 +31,18 @@ class ResourceMonitor:
         self.gpu_power_watts = []
         self.gpu_clock_mhz = []
 
-        self.gpu_handle = None
-        if GPU_MONITORING_AVAILABLE:
-            try:
-                self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
-            except pynvml.NVMLError:
-                print("Warning: Could not get GPU handle. GPU monitoring will be disabled for this session.")
-                self.gpu_handle = None
-                GPU_MONITORING_AVAILABLE = False
-
     def _monitor_loop(self):
+        # Initial call to establish a baseline for CPU percentage
         self.process.cpu_percent(interval=None)
+        
         while not self._stop_event.is_set():
             self.timestamps.append(time.time())
             
+            # CPU and RAM metrics
             self.cpu_usage_percent.append(self.process.cpu_percent(interval=None) / self.cpu_count)
             self.ram_usage_gb.append(self.process.memory_info().rss / (1024 ** 3))
 
+            # GPU metrics, if available
             if self.gpu_handle:
                 try:
                     util_rates = pynvml.nvmlDeviceGetUtilizationRates(self.gpu_handle)
@@ -57,6 +53,7 @@ class ResourceMonitor:
                     self.gpu_power_watts.append(pynvml.nvmlDeviceGetPowerUsage(self.gpu_handle) / 1000.0)
                     self.gpu_clock_mhz.append(pynvml.nvmlDeviceGetClockInfo(self.gpu_handle, pynvml.NVML_CLOCK_SM))
                 except pynvml.NVMLError:
+                    # Append None if reading fails mid-run
                     self.gpu_util_percent.append(None)
                     self.gpu_mem_used_gb.append(None)
                     self.gpu_power_watts.append(None)
@@ -65,18 +62,52 @@ class ResourceMonitor:
             time.sleep(self.interval)
 
     def start(self):
-        print("Starting resource monitor...")
+        if self.monitoring_active:
+            print("Resource monitor is already running.")
+            return
+
+        if PYNML_AVAILABLE:
+            try:
+                pynvml.nvmlInit()
+                self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+                print("pynvml initialized successfully. GPU monitoring enabled.")
+            except pynvml.NVMLError as e:
+                print(f"Warning: Could not initialize pynvml or get GPU handle: {e}. GPU monitoring will be disabled.")
+                self.gpu_handle = None
+        else:
+            print("Warning: pynvml library not found. GPU monitoring is disabled.")
+
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.start()
+        self.monitoring_active = True
+        print("Resource monitor started.")
 
     def stop(self):
-        if self._thread.is_alive():
-            self._stop_event.set()
+        if not self.monitoring_active:
+            return {}
+
+        self._stop_event.set()
+        if self._thread:
             self._thread.join()
+        
+        # Get the metrics BEFORE shutting down pynvml. This is the fix.
+        metrics = self.get_metrics()
+        
+        # Now, explicitly shut down pynvml to release the library
+        if PYNML_AVAILABLE and self.gpu_handle:
+            try:
+                pynvml.nvmlShutdown()
+                print("pynvml shut down successfully.")
+            except pynvml.NVMLError as e:
+                print(f"Warning: Error during pynvml shutdown: {e}")
+
+        self.monitoring_active = False
         print("Resource monitor stopped.")
-        return self.get_metrics()
+        return metrics
         
     def get_metrics(self):
-        if not self.timestamps: return {}
+        if not self.timestamps:
+            return {}
         
         start_time = self.timestamps[0]
         relative_timestamps = [ts - start_time for ts in self.timestamps]
@@ -113,15 +144,18 @@ class ResourceMonitor:
         }
 
         if self.gpu_handle:
-            mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
-            total_gpu_mem_gb = mem_info.total / (1024 ** 3)
-            
+            try:
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
+                total_gpu_mem_gb = mem_info.total / (1024 ** 3)
+            except pynvml.NVMLError:
+                total_gpu_mem_gb = 0
+
             valid_gpu_util = [v for v in self.gpu_util_percent if v is not None]
             valid_gpu_mem_gb = [m for m in self.gpu_mem_used_gb if m is not None]
             valid_gpu_power = [p for p in self.gpu_power_watts if p is not None]
             valid_gpu_clock = [c for c in self.gpu_clock_mhz if c is not None]
             
-            gpu_mem_usage_percent = [(val / total_gpu_mem_gb) * 100 for val in self.gpu_mem_used_gb if val is not None]
+            gpu_mem_usage_percent = [(val / total_gpu_mem_gb) * 100 for val in valid_gpu_mem_gb] if total_gpu_mem_gb > 0 else []
 
             gpu_summary = {
                 "total_gpu_mem_gb": total_gpu_mem_gb,
@@ -150,10 +184,3 @@ class ResourceMonitor:
             metrics["summary"]["gpu"] = gpu_summary
 
         return metrics
-
-    def __del__(self):
-        if GPU_MONITORING_AVAILABLE:
-            try:
-                pynvml.nvmlShutdown()
-            except pynvml.NVMLError:
-                pass

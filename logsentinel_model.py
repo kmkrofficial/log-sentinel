@@ -10,29 +10,7 @@ from peft import (
 )
 from transformers import BertTokenizerFast, BertModel
 from utils.model_loader import load_model_and_tokenizer
-
-def merge_data(data):
-    merged_data, start_positions, current_position = [], [], 0
-    for sublist in data:
-        if isinstance(sublist, (list, tuple)):
-            start_positions.append(current_position)
-            merged_data.extend(sublist)
-            current_position += len(sublist)
-    return merged_data, start_positions
-
-def stack_and_pad_left(tensors):
-    if not tensors: return torch.tensor([]), torch.tensor([])
-    max_len = max(t.shape[0] for t in tensors)
-    padded_tensors, padding_masks = [], []
-    for tensor in tensors:
-        pad_len = max_len - tensor.shape[0]
-        padded_tensor = nn.functional.pad(tensor, (0, 0, pad_len, 0))
-        padding_masks.append(torch.cat([
-            torch.zeros(pad_len, dtype=torch.long, device=tensor.device),
-            torch.ones(tensor.shape[0], dtype=torch.long, device=tensor.device)
-        ]))
-        padded_tensors.append(padded_tensor)
-    return torch.stack(padded_tensors), torch.stack(padding_masks)
+from utils.helpers import merge_data, stack_and_pad_left
 
 class LogSentinelModel(nn.Module):
     def __init__(self, bert_path, llama_path, ft_path=None, is_train_mode=True, device=None, max_content_len=128, max_seq_len=128):
