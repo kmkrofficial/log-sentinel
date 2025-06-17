@@ -48,34 +48,57 @@ class InferenceController:
         details = self.db.get_run_details(run_id)
         return details['run_info'].get('model_name') if details else None
 
-    def _run_bert_phase(self, dataset, temp_embedding_dir, batch_size):
+    def _run_bert_phase(self, dataset, temp_embedding_dir, sequence_batch_size):
         self._log("Phase 1: Starting BERT embedding generation.")
-        bert_model = BertModel.from_pretrained(DEFAULT_BERT_PATH).to(self.device).eval()
+        bert_model = BertModel.from_pretrained(
+            DEFAULT_BERT_PATH, 
+            gradient_checkpointing=True
+        ).to(self.device).eval()
         bert_tokenizer = BertTokenizerFast.from_pretrained(DEFAULT_BERT_PATH)
         llama_config = AutoConfig.from_pretrained(MODELS_DIR / self.model_name if (MODELS_DIR / self.model_name).exists() else self.model_name)
         projector = nn.Sequential(nn.Linear(bert_model.config.hidden_size, llama_config.hidden_size), nn.GELU(), nn.Linear(llama_config.hidden_size, llama_config.hidden_size)).to(self.device).eval()
         projector.load_state_dict(torch.load(os.path.join(self.ft_path, 'projector.pt')))
         
-        total_rows, num_batches, processed_rows = len(dataset), 0, 0
+        total_rows, num_sequence_batches, processed_rows = len(dataset), 0, 0
+        
         with torch.inference_mode():
-            for i in tqdm(range(0, total_rows, batch_size), desc="BERT Phase"):
-                end_idx = min(i + batch_size, total_rows)
+            for i in tqdm(range(0, total_rows, sequence_batch_size), desc="BERT Phase (Sequence Batches)"):
+                end_idx = min(i + sequence_batch_size, total_rows)
                 seqs, _ = dataset.get_batch(list(range(i, end_idx)))
+                
                 merged_logs, start_positions = merge_data(seqs)
+                
                 if not merged_logs:
                     processed_rows += len(seqs)
                     continue
-                inputs = bert_tokenizer(merged_logs, return_tensors="pt", max_length=128, padding=True, truncation=True).to(self.device)
-                projected_outputs = projector(bert_model(**inputs).pooler_output)
-                torch.save({'data': projected_outputs.cpu(), 'pos': start_positions}, os.path.join(temp_embedding_dir, f"batch_{num_batches}.pt"))
-                num_batches += 1
+
+                # --- FIX: Inner-loop batching to process log lines ---
+                all_projected_outputs = []
+                physical_log_batch_size = 64 # Process 64 log lines at a time
+                for j in range(0, len(merged_logs), physical_log_batch_size):
+                    log_batch = merged_logs[j:j+physical_log_batch_size]
+                    inputs = bert_tokenizer(log_batch, return_tensors="pt", max_length=128, padding=True, truncation=True).to(self.device)
+                    bert_outputs = bert_model(**inputs).pooler_output
+                    projected_batch_outputs = projector(bert_outputs)
+                    all_projected_outputs.append(projected_batch_outputs.cpu())
+                
+                if not all_projected_outputs:
+                    processed_rows += len(seqs)
+                    continue
+
+                projected_outputs = torch.cat(all_projected_outputs, dim=0)
+                # --- END FIX ---
+                
+                torch.save({'data': projected_outputs, 'pos': start_positions}, os.path.join(temp_embedding_dir, f"batch_{num_sequence_batches}.pt"))
+                num_sequence_batches += 1
                 processed_rows += len(seqs)
+
                 if self._update_progress(processed_rows, total_rows, self.run_start_time) == "STOP":
                     raise InterruptedError("Stop request received.")
         
         del bert_model, projector, bert_tokenizer, llama_config; gc.collect(); torch.cuda.empty_cache()
         self._log("Phase 1 Complete. BERT and Projector released from memory.")
-        return num_batches
+        return num_sequence_batches
 
     def _run_llama_phase(self, dataset, temp_embedding_dir, num_batches):
         self._log("Phase 2: Starting Llama classification.")
@@ -143,20 +166,12 @@ class InferenceController:
             total_run_time, total_records = time.time() - self.run_start_time, len(dataset)
             time_per_record_ms = (total_run_time / total_records) * 1000 if total_records > 0 else 0
 
-            # This block now handles both modes, creating a unified perf_metrics dict
-            perf_metrics = {
-                "overall": {
-                    "total_run_time_sec": total_run_time,
-                    "time_per_record_ms": time_per_record_ms
-                }
-            }
+            perf_metrics = { "overall": { "total_run_time_sec": total_run_time, "time_per_record_ms": time_per_record_ms } }
             if mode == 'testing':
                 gt_labels = dataset.get_all_labels()
                 preds_numeric, probas_numeric, gt_numeric = safe_np_array(all_preds), safe_np_array(all_probas), gt_labels
                 p, r, f1, _ = precision_recall_fscore_support(gt_numeric, preds_numeric, average='binary', pos_label=1, zero_division=0)
-                perf_metrics["overall"].update({
-                    "accuracy": accuracy_score(gt_numeric, preds_numeric), "precision": p, "recall": r, "f1_score": f1
-                })
+                perf_metrics["overall"].update({ "accuracy": accuracy_score(gt_numeric, preds_numeric), "precision": p, "recall": r, "f1_score": f1 })
                 visualizer.plot_confusion_matrix(confusion_matrix(gt_numeric, preds_numeric), ['Normal', 'Anomalous'])
                 visualizer.plot_roc_curve(gt_numeric, probas_numeric)
                 visualizer.plot_overall_metrics({k: v for k, v in perf_metrics['overall'].items() if k in ['accuracy', 'precision', 'recall', 'f1_score']})

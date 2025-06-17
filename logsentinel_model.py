@@ -19,10 +19,13 @@ class LogSentinelModel(nn.Module):
         self.max_seq_len = max_seq_len
         self.device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        # Step 1: Load base models and tokenizers
         self.llama_model, self.llama_tokenizer = load_model_and_tokenizer(llama_path, is_train_mode)
         self.bert_tokenizer = BertTokenizerFast.from_pretrained(bert_path, do_lower_case=True)
-        self.bert_model = BertModel.from_pretrained(bert_path, low_cpu_mem_usage=True).to(self.device)
+        self.bert_model = BertModel.from_pretrained(
+            bert_path, 
+            low_cpu_mem_usage=True, 
+            gradient_checkpointing=True
+        ).to(self.device)
 
         projector_device = self.llama_model.device
         compute_dtype = self.llama_model.dtype
@@ -42,15 +45,11 @@ class LogSentinelModel(nn.Module):
             return_tensors="pt", padding=True
         ).to(projector_device)
         
-        # Step 2: Setup PEFT adapters based on mode
         self._setup_peft(ft_path, is_train_mode)
 
     def _setup_peft(self, ft_path, is_train_mode):
-        # --- The Core Logic for Inference-Time Adapter Loading ---
         if ft_path and os.path.exists(os.path.join(ft_path, 'adapter_config.json')):
             print(f"Loading components from fine-tuned path: {ft_path}")
-            # For inference, load the adapter ON TOP of the base model.
-            # This avoids the memory-heavy merge operation.
             self.llama_model = PeftModel.from_pretrained(
                 self.llama_model, 
                 os.path.join(ft_path, 'Llama_ft'), 
@@ -61,7 +60,6 @@ class LogSentinelModel(nn.Module):
             print("PEFT adapter and other components loaded for inference/continued training.")
         
         elif is_train_mode:
-            # For a new training run, create a fresh LoRA config.
             print("No adapter found. Creating new PEFT configuration for training.")
             if getattr(self.llama_model, "is_loaded_in_8bit", False) or getattr(self.llama_model, "is_loaded_in_4bit", False):
                 self.llama_model = prepare_model_for_kbit_training(self.llama_model)
@@ -74,12 +72,10 @@ class LogSentinelModel(nn.Module):
             self.llama_model = get_peft_model(self.llama_model, lora_config)
             self.llama_model.print_trainable_parameters()
         else:
-            # This case (inference without a fine-tuned path) should be handled by controller logic
             print("Warning: Inference mode selected but no fine-tuned adapter path was provided.")
 
     def save_ft_model(self, path):
         os.makedirs(path, exist_ok=True)
-        # Save only the adapter, not the full model
         self.llama_model.save_pretrained(os.path.join(path, 'Llama_ft'))
         torch.save(self.projector.state_dict(), os.path.join(path, 'projector.pt'))
         torch.save(self.classifier.state_dict(), os.path.join(path, 'classifier.pt'))
@@ -101,12 +97,25 @@ class LogSentinelModel(nn.Module):
         sequences = [s[:self.max_seq_len] for s in sequences_]
         merged_logs, start_positions = merge_data(sequences)
         if not merged_logs: return None, None
-        inputs = self.bert_tokenizer(merged_logs, return_tensors="pt", max_length=self.max_content_len, padding=True, truncation=True).to(self.bert_model.device)
-        bert_outputs = self.bert_model(**inputs).pooler_output
+
+        # --- FIX: Inner-loop batching for BERT processing ---
+        all_bert_outputs = []
+        physical_batch_size = 64 # Process 64 log lines at a time
+        with torch.no_grad():
+            for i in range(0, len(merged_logs), physical_batch_size):
+                batch_logs = merged_logs[i:i+physical_batch_size]
+                inputs = self.bert_tokenizer(batch_logs, return_tensors="pt", max_length=self.max_content_len, padding=True, truncation=True).to(self.bert_model.device)
+                outputs = self.bert_model(**inputs).pooler_output
+                all_bert_outputs.append(outputs.cpu())
+        
+        if not all_bert_outputs: return None, None
+        bert_outputs = torch.cat(all_bert_outputs, dim=0).to(self.device)
+        # --- END FIX ---
+
         projector_dtype = next(self.projector.parameters()).dtype
         projected_outputs = self.projector(bert_outputs.to(projector_dtype)).to(self.llama_model.dtype)
         if projected_outputs.shape[0] == 0: return [], self.llama_model.device
-        split_indices = start_positions[1:];
+        split_indices = start_positions[1:]
         if not split_indices: return [projected_outputs], self.llama_model.device
         return list(torch.tensor_split(projected_outputs, split_indices, dim=0)), self.llama_model.device
 
@@ -131,7 +140,6 @@ class LogSentinelModel(nn.Module):
 
     def forward(self, sequences_):
         self.eval()
-        # Use torch.inference_mode() for max speed and memory efficiency
         with torch.inference_mode():
             logits, original_indices = self._get_logits(sequences_)
             if logits is None:
