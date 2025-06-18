@@ -8,7 +8,7 @@ from peft import (
     get_peft_model,
     prepare_model_for_kbit_training
 )
-from transformers import BertTokenizerFast, BertModel
+from transformers import AutoTokenizer, AutoModel, AutoConfig
 from utils.model_loader import load_model_and_tokenizer
 from utils.helpers import merge_data, stack_and_pad_left
 
@@ -20,12 +20,15 @@ class LogSentinelModel(nn.Module):
         self.device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         self.llama_model, self.llama_tokenizer = load_model_and_tokenizer(llama_path, is_train_mode)
-        self.bert_tokenizer = BertTokenizerFast.from_pretrained(bert_path, do_lower_case=True)
-        self.bert_model = BertModel.from_pretrained(
-            bert_path, 
-            low_cpu_mem_usage=True, 
-            gradient_checkpointing=True
+        
+        bert_model_path = bert_path.parent / bert_path.name
+        self.bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_path)
+        self.bert_model = AutoModel.from_pretrained(
+            bert_model_path,
+            low_cpu_mem_usage=True
         ).to(self.device)
+        if hasattr(self.bert_model.config, 'gradient_checkpointing') and self.bert_model.config.gradient_checkpointing:
+             self.bert_model.gradient_checkpointing_enable()
 
         projector_device = self.llama_model.device
         compute_dtype = self.llama_model.dtype
@@ -50,22 +53,19 @@ class LogSentinelModel(nn.Module):
     def _setup_peft(self, ft_path, is_train_mode):
         if ft_path and os.path.exists(os.path.join(ft_path, 'adapter_config.json')):
             print(f"Loading components from fine-tuned path: {ft_path}")
-            self.llama_model = PeftModel.from_pretrained(
-                self.llama_model, 
-                os.path.join(ft_path, 'Llama_ft'), 
-                is_trainable=is_train_mode
-            )
+            self.llama_model = PeftModel.from_pretrained(self.llama_model, os.path.join(ft_path, 'Llama_ft'), is_trainable=is_train_mode)
             self.projector.load_state_dict(torch.load(os.path.join(ft_path, 'projector.pt')))
             self.classifier.load_state_dict(torch.load(os.path.join(ft_path, 'classifier.pt')))
             print("PEFT adapter and other components loaded for inference/continued training.")
-        
         elif is_train_mode:
             print("No adapter found. Creating new PEFT configuration for training.")
             if getattr(self.llama_model, "is_loaded_in_8bit", False) or getattr(self.llama_model, "is_loaded_in_4bit", False):
                 self.llama_model = prepare_model_for_kbit_training(self.llama_model)
             
             lora_config = LoraConfig(
-                r=8, lora_alpha=16, lora_dropout=0.1,
+                r=32,
+                lora_alpha=64,
+                lora_dropout=0.1,
                 target_modules=["q_proj", "v_proj"],
                 bias="none", task_type=TaskType.CAUSAL_LM
             )
@@ -92,25 +92,37 @@ class LogSentinelModel(nn.Module):
     def set_train_only_classifier(self): self._set_trainable(classifier=True)
     def set_train_projector_and_classifier(self): self._set_trainable(projector=True, classifier=True)
     def set_finetuning_all(self): self._set_trainable(projector=True, classifier=True, llama_lora=True)
+    
+    # --- FIX: Mean pooling for sentence-transformers ---
+    def _mean_pooling(self, model_output, attention_mask):
+        token_embeddings = model_output[0] # First element of model_output contains all token embeddings
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
     def get_cls_embeddings(self, sequences_):
         sequences = [s[:self.max_seq_len] for s in sequences_]
         merged_logs, start_positions = merge_data(sequences)
         if not merged_logs: return None, None
 
-        # --- FIX: Inner-loop batching for BERT processing ---
         all_bert_outputs = []
-        physical_batch_size = 64 # Process 64 log lines at a time
+        physical_batch_size = 128
         with torch.no_grad():
             for i in range(0, len(merged_logs), physical_batch_size):
                 batch_logs = merged_logs[i:i+physical_batch_size]
                 inputs = self.bert_tokenizer(batch_logs, return_tensors="pt", max_length=self.max_content_len, padding=True, truncation=True).to(self.bert_model.device)
-                outputs = self.bert_model(**inputs).pooler_output
-                all_bert_outputs.append(outputs.cpu())
+                
+                model_output = self.bert_model(**inputs)
+
+                # Use mean pooling for sentence-transformers, CLS token for others
+                if 'sentence-transformer' in self.bert_model.config._name_or_path:
+                    sentence_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
+                else:
+                    sentence_embeddings = model_output.last_hidden_state[:, 0, :]
+                
+                all_bert_outputs.append(sentence_embeddings.cpu())
         
         if not all_bert_outputs: return None, None
         bert_outputs = torch.cat(all_bert_outputs, dim=0).to(self.device)
-        # --- END FIX ---
 
         projector_dtype = next(self.projector.parameters()).dtype
         projected_outputs = self.projector(bert_outputs.to(projector_dtype)).to(self.llama_model.dtype)

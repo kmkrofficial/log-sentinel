@@ -30,15 +30,23 @@ class LogDataset(Dataset):
         df['Processed_Content'] = df['Content'].apply(replace_patterns)
         
         self.sequences = [content.split(' ;-; ') for content in df['Processed_Content'].values]
-        self.labels = df['Label'].values
+        # Ensure labels are integers, handle potential NaNs from file read
+        self.labels = df['Label'].fillna(-1).astype(int).values
 
         self._calculate_class_stats()
         print(f"Dataset initialized. Total sequences: {len(self.labels)}")
+        print(f"Class counts (0: Normal, 1: Anomalous): {self.class_counts}")
+
 
     def _calculate_class_stats(self):
-        """Calculates statistics needed for oversampling in the training loop."""
-        num_normal = (self.labels == 0).sum()
-        num_anomalous = (self.labels == 1).sum()
+        """Calculates statistics needed for oversampling and weighted loss."""
+        # Use numpy for efficient counting of valid labels (0 and 1)
+        valid_labels = self.labels[self.labels != -1]
+        unique, counts = np.unique(valid_labels, return_counts=True)
+        self.class_counts = dict(zip(unique, counts))
+
+        num_normal = self.class_counts.get(0, 0)
+        num_anomalous = self.class_counts.get(1, 0)
 
         if num_normal > num_anomalous:
             self.minority_label = 1

@@ -1,30 +1,32 @@
 import sqlite3
 import json
 import time
-import uuid
 from pathlib import Path
 
 class DatabaseManager:
     def __init__(self, db_path='logsentinel.db'):
         self.db_path = Path(db_path)
         self.conn = None
-        self._connect(); self._create_tables()
+        self._connect()
+        self._create_tables()
 
     def _connect(self):
         try:
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
         except sqlite3.Error as e:
-            print(f"Database connection error: {e}"); raise
+            print(f"Database connection error: {e}")
+            raise
 
     def _create_tables(self):
         if not self.conn: return
         cursor = self.conn.cursor()
         try:
-            # FIX: Added run_type column
+            # --- FIX: Changed run_id to INTEGER and added nickname ---
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS runs (
-                run_id TEXT PRIMARY KEY,
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nickname TEXT,
                 run_type TEXT NOT NULL,
                 start_time REAL NOT NULL,
                 end_time REAL,
@@ -34,33 +36,37 @@ class DatabaseManager:
                 report_path TEXT
             );
             """)
-            cursor.execute("CREATE TABLE IF NOT EXISTS hyperparameters (run_id TEXT PRIMARY KEY, params_json TEXT NOT NULL, FOREIGN KEY (run_id) REFERENCES runs (run_id));")
-            cursor.execute("CREATE TABLE IF NOT EXISTS performance_metrics (run_id TEXT PRIMARY KEY, metrics_json TEXT NOT NULL, FOREIGN KEY (run_id) REFERENCES runs (run_id));")
-            cursor.execute("CREATE TABLE IF NOT EXISTS resource_metrics (run_id TEXT PRIMARY KEY, metrics_json TEXT NOT NULL, FOREIGN KEY (run_id) REFERENCES runs (run_id));")
+            cursor.execute("CREATE TABLE IF NOT EXISTS hyperparameters (run_id INTEGER PRIMARY KEY, params_json TEXT NOT NULL, FOREIGN KEY (run_id) REFERENCES runs (run_id));")
+            cursor.execute("CREATE TABLE IF NOT EXISTS performance_metrics (run_id INTEGER PRIMARY KEY, metrics_json TEXT NOT NULL, FOREIGN KEY (run_id) REFERENCES runs (run_id));")
+            cursor.execute("CREATE TABLE IF NOT EXISTS resource_metrics (run_id INTEGER PRIMARY KEY, metrics_json TEXT NOT NULL, FOREIGN KEY (run_id) REFERENCES runs (run_id));")
             self.conn.commit()
         except sqlite3.Error as e:
             print(f"Error creating tables: {e}")
         finally:
             cursor.close()
 
-    def create_new_run(self, run_type, model_name, dataset_name, hyperparameters):
+    def create_new_run(self, run_type, model_name, dataset_name, hyperparameters, nickname=None):
         if not self.conn: return None
-        run_id = str(uuid.uuid4())
         start_time = time.time()
         cursor = self.conn.cursor()
         try:
-            cursor.execute("INSERT INTO runs (run_id, run_type, start_time, status, model_name, dataset_name) VALUES (?, ?, ?, ?, ?, ?)", (run_id, run_type, start_time, 'STARTED', model_name, dataset_name))
+            cursor.execute(
+                "INSERT INTO runs (nickname, run_type, start_time, status, model_name, dataset_name) VALUES (?, ?, ?, ?, ?, ?)",
+                (nickname, run_type, start_time, 'STARTED', model_name, dataset_name)
+            )
+            run_id = cursor.lastrowid
             if hyperparameters:
                 cursor.execute("INSERT INTO hyperparameters (run_id, params_json) VALUES (?, ?)", (run_id, json.dumps(hyperparameters)))
             self.conn.commit()
             return run_id
         except sqlite3.Error as e:
-            print(f"Error creating new run: {e}"); self.conn.rollback(); return None
+            print(f"Error creating new run: {e}")
+            self.conn.rollback()
+            return None
         finally:
             cursor.close()
 
     def save_performance_metrics(self, run_id, metrics_dict):
-        # ... (This method remains unchanged) ...
         if not self.conn or not run_id: return
         cursor = self.conn.cursor()
         try:
@@ -70,7 +76,6 @@ class DatabaseManager:
         finally: cursor.close()
 
     def save_resource_metrics(self, run_id, resource_dict):
-        # ... (This method remains unchanged) ...
         if not self.conn or not run_id: return
         cursor = self.conn.cursor()
         try:
@@ -80,7 +85,6 @@ class DatabaseManager:
         finally: cursor.close()
 
     def update_run_status(self, run_id, status, report_path=None):
-        # ... (This method remains unchanged) ...
         if not self.conn or not run_id: return
         end_time = time.time(); cursor = self.conn.cursor()
         try:
@@ -91,18 +95,25 @@ class DatabaseManager:
             print(f"Error updating run status for {run_id}: {e}"); self.conn.rollback()
         finally: cursor.close()
 
-    def get_all_runs(self):
-        # ... (This method remains unchanged) ...
+    def get_all_runs(self, run_type=None):
         if not self.conn: return []
         cursor = self.conn.cursor()
         try:
-            cursor.execute("SELECT * FROM runs ORDER BY start_time DESC"); return [dict(run) for run in cursor.fetchall()]
+            query = "SELECT * FROM runs"
+            params = ()
+            if run_type:
+                query += " WHERE run_type = ?"
+                params = (run_type,)
+            query += " ORDER BY start_time DESC"
+            cursor.execute(query, params)
+            return [dict(run) for run in cursor.fetchall()]
         except sqlite3.Error as e:
-            print(f"Error getting all runs: {e}"); return []
-        finally: cursor.close()
+            print(f"Error getting runs: {e}")
+            return []
+        finally:
+            cursor.close()
 
     def get_run_details(self, run_id):
-        # ... (This method remains unchanged) ...
         if not self.conn or not run_id: return None
         details = {}; cursor = self.conn.cursor()
         try:
