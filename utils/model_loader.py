@@ -26,15 +26,28 @@ def load_model_and_tokenizer(model_name_or_path, is_train_mode=True):
         tokenizer.pad_token = tokenizer.eos_token
         print("Tokenizer pad_token set to eos_token.")
 
-    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-    
-    # FIX: Explicitly load model in float32. This is the master copy for GradScaler.
-    # The training loop will cast operations to float16 via autocast.
-    compute_dtype = torch.float32
-    attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+    # --- FIX: Force float16 for stable Windows compatibility ---
+    # bfloat16 has poor support in bitsandbytes on Windows. 
+    # float16 is the reliable choice for half-precision.
+    compute_dtype = torch.float16
+    print(f"Using compute data type: {compute_dtype} for Windows compatibility.")
 
-    print(f"Loading model '{path_to_load}' with 8-bit quantization...")
-    print(f"Master weights will be loaded in '{compute_dtype}'.")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=compute_dtype
+    )
+    
+    attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+    print(f"Using attention implementation: {attn_implementation}")
+    if attn_implementation == "flash_attention_2":
+        print("Flash Attention 2 will be used for faster and more memory-efficient inference.")
+    else:
+        print("Flash Attention 2 not available. Falling back to default 'sdpa' implementation.")
+
+    print(f"Loading model '{path_to_load}' with 4-bit quantization...")
+    print(f"Model computations will be performed in '{compute_dtype}'.")
     
     model = AutoModelForCausalLM.from_pretrained(
         path_to_load,
