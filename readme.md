@@ -39,8 +39,8 @@ Follow these steps to set up the LogSentinel environment on your machine.
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repository-url>
-cd <repository-name>
+git clone https://github.com/kmkrofficial/log-sentinel
+cd log-sentinel
 ```
 
 ### 2. Create a Python Virtual Environment
