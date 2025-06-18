@@ -52,6 +52,22 @@ class LogVisualizer:
         ax.grid(True)
         self._save_plot(fig, 'roc_curve.png')
 
+    def plot_training_loss(self, loss_data):
+        if not loss_data:
+            return
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(range(len(loss_data)), loss_data, label='Batch Loss')
+        # Simple moving average to show the trend
+        if len(loss_data) > 100:
+            moving_avg = np.convolve(loss_data, np.ones(100)/100, mode='valid')
+            ax.plot(np.arange(99, len(loss_data)), moving_avg, color='red', linestyle='--', label='100-step Moving Avg')
+        ax.set_xlabel('Training Step')
+        ax.set_ylabel('Loss')
+        ax.set_title('Training Loss Over Time')
+        ax.legend()
+        ax.grid(True)
+        self._save_plot(fig, 'training_loss.png')
+
     def plot_resource_usage(self, resource_metrics):
         ts_data = resource_metrics.get('time_series', {})
         summary = resource_metrics.get('summary', {})
