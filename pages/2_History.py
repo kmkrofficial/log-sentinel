@@ -11,7 +11,6 @@ from config import DB_PATH
 st.set_page_config(page_title="Run History", page_icon="📜", layout="wide")
 
 def format_duration(seconds):
-    """Formats a duration in seconds into a HH:MM:SS string."""
     if seconds is None:
         return "N/A"
     seconds = int(seconds)
@@ -118,7 +117,6 @@ if st.session_state.selected_run_id_for_view:
         if run_details:
             info, h_params, p_metrics, r_metrics = run_details.values()
             
-            # --- Run Summary (Top of details) ---
             st.subheader(f"Details for Run ID: `{info.get('run_id')}`")
             if st.button("Close Details"):
                 st.session_state.selected_run_id_for_view = None
@@ -131,7 +129,6 @@ if st.session_state.selected_run_id_for_view:
             summary_cols[2].metric("Start Time", time.strftime('%H:%M:%S', time.localtime(info.get('start_time'))))
             summary_cols[3].metric("Total Duration", format_duration(duration))
             
-            # --- Performance Metrics ---
             with st.expander("📊 Performance Metrics", expanded=True):
                 if p_metrics and 'overall' in p_metrics:
                     overall = p_metrics.get('overall', {})
@@ -151,7 +148,6 @@ if st.session_state.selected_run_id_for_view:
                 else:
                     st.warning("No performance metrics available.")
 
-            # --- Resource Metrics ---
             with st.expander("🛠️ Resource Metrics", expanded=True):
                 if r_metrics and 'summary' in r_metrics:
                     summary = r_metrics.get('summary', {})
@@ -185,7 +181,6 @@ if st.session_state.selected_run_id_for_view:
                 else:
                     st.warning("No resource metrics available.")
             
-            # --- Reports & Visualizations ---
             with st.expander("📄 Reports & Visualizations", expanded=True):
                 report_path_str = info.get('report_path')
                 if report_path_str and Path(report_path_str).exists():
@@ -198,13 +193,14 @@ if st.session_state.selected_run_id_for_view:
                                     st.download_button("Download Results CSV", fp, csv_files[0].name, "text/csv")
                         
                         plot_files = {
-                            'confusion_matrix.png': "Shows the model's performance by comparing predicted labels to true labels. The diagonal from top-left to bottom-right indicates correct predictions.",
-                            'roc_curve.png': "The Receiver Operating Characteristic (ROC) curve plots the true positive rate against the false positive rate. A curve closer to the top-left corner indicates better model performance.",
+                            'training_loss.png': "Shows the batch loss over the course of the training run. A downward trend indicates the model is learning.",
+                            'confusion_matrix.png': "Compares predicted labels to true labels. The diagonal from top-left to bottom-right indicates correct predictions.",
+                            'roc_curve.png': "The Receiver Operating Characteristic (ROC) curve plots true positive rate against false positive rate. A curve closer to the top-left corner indicates better performance.",
                             'overall_metrics.png': "A bar chart summarizing the key classification metrics: Accuracy, Precision, Recall, and F1-Score.",
                             'cpu_usage.png': "Tracks the CPU utilization percentage over the duration of the run.",
-                            'ram_usage.png': "Tracks the RAM (system memory) consumption in Gigabytes (GB) over the duration of the run.",
-                            'gpu_utilization.png': "Tracks the GPU processing utilization percentage over time. A higher value means the GPU was kept busy.",
-                            'gpu_memory.png': "Tracks the dedicated GPU Memory (VRAM) consumption in Gigabytes (GB) over time."
+                            'ram_usage.png': "Tracks RAM consumption in Gigabytes (GB) over the duration of the run.",
+                            'gpu_utilization.png': "Tracks GPU processing utilization percentage over time.",
+                            'gpu_memory.png': "Tracks dedicated GPU Memory (VRAM) consumption in Gigabytes (GB) over time."
                         }
                         
                         image_paths = []

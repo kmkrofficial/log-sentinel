@@ -6,7 +6,7 @@ import torch
 import time
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
-from transformers import get_linear_schedule_with_warmup
+import bitsandbytes as bnb
 
 from config import REPORTS_DIR, DEFAULT_BERT_PATH
 from utils.database_manager import DatabaseManager
@@ -25,6 +25,7 @@ class TrainingController:
         self.visualizer = None
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.global_step_count, self.total_training_steps, self.run_start_time = 0, 0, 0
+        self.batch_losses = [] # For plotting loss curve
 
     def _log(self, message):
         print(message)
@@ -58,9 +59,10 @@ class TrainingController:
         if not trainable_params:
             self._log(f"Phase '{phase_name}' skipped: No trainable parameters.")
             return True
-        optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
-        # --- FIX: Conditionally enable GradScaler and set correct autocast dtype ---
+        # --- FIX: Use PagedAdamW8bit for numerical stability with quantized models ---
+        optimizer = bnb.optim.PagedAdamW8bit(trainable_params, lr=lr)
+
         model_dtype = next(self.model.parameters()).dtype
         use_scaler = (model_dtype == torch.float16)
         
@@ -68,6 +70,7 @@ class TrainingController:
         
         scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
         autocast_dtype = model_dtype if model_dtype in [torch.float16, torch.bfloat16] else torch.float16
+        grad_accum_steps = self.hp['batch_size'] // self.hp['micro_batch_size']
 
         for epoch in range(int(n_epochs)):
             epoch_str = f"Epoch {epoch + 1}/{int(n_epochs)} ({phase_name})"
@@ -85,21 +88,23 @@ class TrainingController:
                     logits, int_labels = self.model.train_helper(seqs, labels)
                     if logits.shape[0] == 0:
                         continue
-                    loss = criterion(logits, int_labels) / (self.hp['batch_size'] // self.hp['micro_batch_size'])
+                    loss = criterion(logits, int_labels) / grad_accum_steps
                 
                 scaler.scale(loss).backward()
 
-                if (i_th + 1) % (self.hp['batch_size'] // self.hp['micro_batch_size']) == 0:
+                if (i_th + 1) % grad_accum_steps == 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
                 
+                current_loss = loss.item() * grad_accum_steps
+                self.batch_losses.append(current_loss)
                 elapsed = time.time() - self.run_start_time
                 progress = self.global_step_count / self.total_training_steps if self.total_training_steps > 0 else 0
                 etc = (elapsed / progress) * (1 - progress) if progress > 0 else 0
-                status = {"epoch": epoch_str, "progress": progress, "loss": loss.item() * (self.hp['batch_size'] // self.hp['micro_batch_size']), "etc": etc}
+                status = {"epoch": epoch_str, "progress": progress, "loss": current_loss, "etc": etc}
                 if self.callback(status) == 'STOP':
                     self._log("Stop request received. Aborting training.")
                     return False
@@ -110,18 +115,21 @@ class TrainingController:
 
     def _evaluate(self):
         self._log("\n--- Starting Final Evaluation ---")
-        self.callback({"epoch": "Final Evaluation", "progress": 1.0, "loss": 0.0, "etc": 0.0})
         self.model.eval()
         all_preds, gt_labels = [], self.test_dataset.get_all_labels()
         eval_start_time = time.time()
         
-        # Match evaluation autocast with model's dtype
         model_dtype = next(self.model.parameters()).dtype
         autocast_dtype = model_dtype if model_dtype in [torch.float16, torch.bfloat16] else torch.float16
-
+        
+        total_items = len(self.test_dataset)
         with torch.no_grad():
-            for i in tqdm(range(0, len(self.test_dataset), self.hp['batch_size']), desc="Evaluating"):
-                end_idx = min(i + self.hp['batch_size'], len(self.test_dataset))
+            for i in tqdm(range(0, total_items, self.hp['batch_size']), desc="Evaluating"):
+                # --- FIX: Send progress updates during evaluation ---
+                progress = (i + 1) / total_items
+                self.callback({"epoch": "Final Evaluation", "progress": progress})
+
+                end_idx = min(i + self.hp['batch_size'], total_items)
                 seqs, _ = self.test_dataset.get_batch(list(range(i, end_idx)))
                 with torch.autocast(device_type=self.device.type, dtype=autocast_dtype, enabled=(self.device.type == 'cuda')):
                     logits = self.model(seqs)
@@ -144,12 +152,14 @@ class TrainingController:
                 "normal": {"precision": p_det[0], "recall": r_det[0], "f1": f1_det[0], "support": int(s_det[0])},
                 "anomalous": {"precision": p_det[1], "recall": r_det[1], "f1": f1_det[1], "support": int(s_det[1])}
             },
-            "confusion_matrix": confusion_matrix(gt_numeric, preds_numeric, labels=[0, 1]).tolist()
+            "confusion_matrix": confusion_matrix(gt_numeric, preds_numeric, labels=[0, 1]).tolist(),
+            "training_loss_series": self.batch_losses
         }
         
         self.visualizer.plot_confusion_matrix(np.array(perf_metrics['confusion_matrix']), ['Normal', 'Anomalous'])
         metrics_for_plot = {k: v for k, v in perf_metrics['overall'].items() if k in ['accuracy', 'precision', 'recall', 'f1_score']}
         self.visualizer.plot_overall_metrics(metrics_for_plot)
+        self.visualizer.plot_training_loss(self.batch_losses)
         
         return perf_metrics
 
