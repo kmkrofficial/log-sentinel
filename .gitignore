@@ -211,6 +211,6 @@ pyrightconfig.json
 /reports
 /datasets
 *.rar
-
+*.whl
 
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks,visualstudiocode

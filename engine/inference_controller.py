@@ -56,9 +56,12 @@ class InferenceController:
         ).to(self.device).eval()
         bert_tokenizer = BertTokenizerFast.from_pretrained(DEFAULT_BERT_PATH)
         llama_config = AutoConfig.from_pretrained(MODELS_DIR / self.model_name if (MODELS_DIR / self.model_name).exists() else self.model_name)
-        projector = nn.Sequential(nn.Linear(bert_model.config.hidden_size, llama_config.hidden_size), nn.GELU(), nn.Linear(llama_config.hidden_size, llama_config.hidden_size)).to(self.device).eval()
-        projector.load_state_dict(torch.load(os.path.join(self.ft_path, 'projector.pt')))
         
+        # Load the projector and immediately cast it to the correct compute dtype
+        projector = nn.Sequential(nn.Linear(bert_model.config.hidden_size, llama_config.hidden_size), nn.GELU(), nn.Linear(llama_config.hidden_size, llama_config.hidden_size)).to(self.device).eval()
+        projector_state_dict = torch.load(os.path.join(self.ft_path, 'projector.pt'), map_location=self.device)
+        projector.load_state_dict(projector_state_dict)
+
         total_rows, num_sequence_batches, processed_rows = len(dataset), 0, 0
         
         with torch.inference_mode():
@@ -67,18 +70,17 @@ class InferenceController:
                 seqs, _ = dataset.get_batch(list(range(i, end_idx)))
                 
                 merged_logs, start_positions = merge_data(seqs)
-                
                 if not merged_logs:
                     processed_rows += len(seqs)
                     continue
 
-                # --- FIX: Inner-loop batching to process log lines ---
                 all_projected_outputs = []
-                physical_log_batch_size = 64 # Process 64 log lines at a time
+                physical_log_batch_size = 128
                 for j in range(0, len(merged_logs), physical_log_batch_size):
                     log_batch = merged_logs[j:j+physical_log_batch_size]
                     inputs = bert_tokenizer(log_batch, return_tensors="pt", max_length=128, padding=True, truncation=True).to(self.device)
                     bert_outputs = bert_model(**inputs).pooler_output
+                    # Projector expects float32 input from BERT
                     projected_batch_outputs = projector(bert_outputs)
                     all_projected_outputs.append(projected_batch_outputs.cpu())
                 
@@ -87,7 +89,6 @@ class InferenceController:
                     continue
 
                 projected_outputs = torch.cat(all_projected_outputs, dim=0)
-                # --- END FIX ---
                 
                 torch.save({'data': projected_outputs, 'pos': start_positions}, os.path.join(temp_embedding_dir, f"batch_{num_sequence_batches}.pt"))
                 num_sequence_batches += 1
@@ -103,28 +104,44 @@ class InferenceController:
     def _run_llama_phase(self, dataset, temp_embedding_dir, num_batches):
         self._log("Phase 2: Starting Llama classification.")
         llama_model, llama_tokenizer = load_model_and_tokenizer(self.model_name, is_train_mode=False)
+        model_dtype = llama_model.dtype # Get the actual dtype (e.g., bfloat16)
+        
         llama_model = PeftModel.from_pretrained(llama_model, os.path.join(self.ft_path, 'Llama_ft'), is_trainable=False).eval()
-        classifier = nn.Linear(llama_model.config.hidden_size, 2).to(self.device).eval()
-        classifier.load_state_dict(torch.load(os.path.join(self.ft_path, 'classifier.pt')))
+        
+        # --- FIX: Load the classifier and immediately cast it to the model's compute dtype ---
+        classifier = nn.Linear(llama_model.config.hidden_size, 2).to(self.device).to(model_dtype).eval()
+        classifier_state_dict = torch.load(os.path.join(self.ft_path, 'classifier.pt'), map_location=self.device)
+        classifier.load_state_dict(classifier_state_dict)
+        
         instruc_tokens = llama_tokenizer(['Below is a sequence of system log messages:'], return_tensors="pt", padding=True).to(self.device)
         
         all_preds, all_probas, processed_rows, total_rows = [], [], 0, len(dataset)
         with torch.inference_mode():
             for i in tqdm(range(num_batches), desc="Llama Phase"):
                 batch_data = torch.load(os.path.join(temp_embedding_dir, f"batch_{i}.pt"))
-                projected_outputs, start_positions = batch_data['data'].to(self.device), batch_data['pos']
+                # Cast the loaded embeddings to the correct model dtype right away
+                projected_outputs = batch_data['data'].to(self.device).to(model_dtype)
+                start_positions = batch_data['pos']
                 if not start_positions: continue
                 
                 seq_embeddings = list(torch.tensor_split(projected_outputs, start_positions[1:], dim=0)) if len(start_positions) > 1 else [projected_outputs]
-                valid_embeddings = [torch.cat([llama_model.get_input_embeddings()(instruc_tokens['input_ids'])[0], se], dim=0) for se in seq_embeddings if se is not None and se.shape[0] > 0]
+                
+                embed_layer = llama_model.get_input_embeddings()
+                instruc_embeds = embed_layer(instruc_tokens['input_ids'])
+
+                valid_embeddings = [torch.cat([instruc_embeds[0], se], dim=0) for se in seq_embeddings if se is not None and se.shape[0] > 0]
                 if not valid_embeddings:
                     processed_rows += len(seq_embeddings)
                     continue
                 
                 inputs_embeds, attention_mask = stack_and_pad_left(valid_embeddings)
+                
+                # The model will now handle inputs consistently
                 outputs = llama_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
+                
                 sequence_lengths = attention_mask.sum(dim=1) - 1
                 cls_input_hidden_state = outputs.hidden_states[-1][torch.arange(len(valid_embeddings), device=self.device), sequence_lengths]
+                
                 probas = torch.softmax(classifier(cls_input_hidden_state), dim=-1)
                 all_preds.extend(torch.argmax(probas, dim=-1).cpu().numpy())
                 all_probas.extend(probas[:, 1].cpu().numpy())

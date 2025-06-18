@@ -59,27 +59,37 @@ class TrainingController:
             self._log(f"Phase '{phase_name}' skipped: No trainable parameters.")
             return True
         optimizer = torch.optim.AdamW(trainable_params, lr=lr)
-        scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == 'cuda'))
-        micro_batch_size, grad_accum_steps = self.hp['micro_batch_size'], self.hp['batch_size'] // self.hp['micro_batch_size']
+
+        # --- FIX: Conditionally enable GradScaler and set correct autocast dtype ---
+        model_dtype = next(self.model.parameters()).dtype
+        use_scaler = (model_dtype == torch.float16)
         
+        self._log(f"Model DType: {model_dtype}. Using GradScaler: {use_scaler}.")
+        
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+        autocast_dtype = model_dtype if model_dtype in [torch.float16, torch.bfloat16] else torch.float16
+
         for epoch in range(int(n_epochs)):
             epoch_str = f"Epoch {epoch + 1}/{int(n_epochs)} ({phase_name})"
             self._log(f"--- {epoch_str} ---")
             random.shuffle(indexes_for_phase)
             optimizer.zero_grad()
-            for i_th, start_idx in enumerate(range(0, len(indexes_for_phase), micro_batch_size)):
+            for i_th, start_idx in enumerate(range(0, len(indexes_for_phase), self.hp['micro_batch_size'])):
                 self.global_step_count += 1
-                end_idx = min(start_idx + micro_batch_size, len(indexes_for_phase))
+                end_idx = min(start_idx + self.hp['micro_batch_size'], len(indexes_for_phase))
                 if not (batch_indexes := indexes_for_phase[start_idx:end_idx]):
                     continue
                 seqs, labels = self.train_dataset.get_batch(batch_indexes)
-                with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=(self.device.type == 'cuda')):
+
+                with torch.autocast(device_type=self.device.type, dtype=autocast_dtype, enabled=(self.device.type == 'cuda')):
                     logits, int_labels = self.model.train_helper(seqs, labels)
                     if logits.shape[0] == 0:
                         continue
-                    loss = criterion(logits, int_labels) / grad_accum_steps
+                    loss = criterion(logits, int_labels) / (self.hp['batch_size'] // self.hp['micro_batch_size'])
+                
                 scaler.scale(loss).backward()
-                if (i_th + 1) % grad_accum_steps == 0:
+
+                if (i_th + 1) % (self.hp['batch_size'] // self.hp['micro_batch_size']) == 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                     scaler.step(optimizer)
@@ -89,7 +99,7 @@ class TrainingController:
                 elapsed = time.time() - self.run_start_time
                 progress = self.global_step_count / self.total_training_steps if self.total_training_steps > 0 else 0
                 etc = (elapsed / progress) * (1 - progress) if progress > 0 else 0
-                status = {"epoch": epoch_str, "progress": progress, "loss": loss.item() * grad_accum_steps, "etc": etc}
+                status = {"epoch": epoch_str, "progress": progress, "loss": loss.item() * (self.hp['batch_size'] // self.hp['micro_batch_size']), "etc": etc}
                 if self.callback(status) == 'STOP':
                     self._log("Stop request received. Aborting training.")
                     return False
@@ -104,11 +114,16 @@ class TrainingController:
         self.model.eval()
         all_preds, gt_labels = [], self.test_dataset.get_all_labels()
         eval_start_time = time.time()
+        
+        # Match evaluation autocast with model's dtype
+        model_dtype = next(self.model.parameters()).dtype
+        autocast_dtype = model_dtype if model_dtype in [torch.float16, torch.bfloat16] else torch.float16
+
         with torch.no_grad():
             for i in tqdm(range(0, len(self.test_dataset), self.hp['batch_size']), desc="Evaluating"):
                 end_idx = min(i + self.hp['batch_size'], len(self.test_dataset))
                 seqs, _ = self.test_dataset.get_batch(list(range(i, end_idx)))
-                with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=(self.device.type == 'cuda')):
+                with torch.autocast(device_type=self.device.type, dtype=autocast_dtype, enabled=(self.device.type == 'cuda')):
                     logits = self.model(seqs)
                 all_preds.extend(torch.argmax(logits, dim=-1).cpu().numpy())
         
