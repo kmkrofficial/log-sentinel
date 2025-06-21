@@ -11,7 +11,6 @@ _PATTERNS = [
     r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d{1,5})?',  # IP Address
     r'([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}',  # MAC Address
     r'[a-zA-Z0-9]*[:\.]*([/\\]+[^/\\\s\[\]]+)+[/\\]*',  # File Path
-    r'[a-zA-Z\.\:\-\_]*\d[a-zA-Z0-9\.\:\-\_]*',  # Word with numbers
 ]
 _COMBINED_PATTERN = re.compile('|'.join(_PATTERNS))
 
@@ -23,9 +22,16 @@ def replace_patterns(text):
 # --- Dataset Class ---
 
 class LogDataset(Dataset):
-    def __init__(self, file_path):
-        print(f"Loading and preprocessing data from: {file_path}")
-        df = pd.read_csv(file_path)
+    # --- FIX: Modified to accept a file_path OR a pre-loaded dataframe ---
+    def __init__(self, file_path=None, dataframe=None):
+        if dataframe is not None:
+            df = dataframe
+            print(f"Loading and preprocessing data from pre-loaded DataFrame of size {len(df)}.")
+        elif file_path is not None:
+            print(f"Loading and preprocessing data from: {file_path}")
+            df = pd.read_csv(file_path)
+        else:
+            raise ValueError("LogDataset must be initialized with either a 'file_path' or a 'dataframe'.")
 
         df['Processed_Content'] = df['Content'].apply(replace_patterns)
         
@@ -40,7 +46,6 @@ class LogDataset(Dataset):
 
     def _calculate_class_stats(self):
         """Calculates statistics needed for oversampling and weighted loss."""
-        # Use numpy for efficient counting of valid labels (0 and 1)
         valid_labels = self.labels[self.labels != -1]
         unique, counts = np.unique(valid_labels, return_counts=True)
         self.class_counts = dict(zip(unique, counts))
@@ -50,17 +55,22 @@ class LogDataset(Dataset):
 
         if num_normal > num_anomalous:
             self.minority_label = 1
+            self.majority_label = 0
             self.num_less = num_anomalous
             self.num_majority = num_normal
         else:
             self.minority_label = 0
+            self.majority_label = 1
             self.num_less = num_normal
             self.num_majority = num_anomalous
             
         if self.num_less > 0:
             self.less_indexes = np.where(self.labels == self.minority_label)[0]
+            self.majority_indexes = np.where(self.labels == self.majority_label)[0]
         else:
             self.less_indexes = np.array([], dtype=int)
+            self.majority_indexes = np.where(self.labels != -1)[0]
+
 
     def __len__(self):
         return len(self.labels)

@@ -18,11 +18,9 @@ st.set_page_config(page_title="Evaluate & Predict", page_icon="🧪", layout="wi
 def get_trained_models_from_db():
     """Fetches all completed training runs from the database."""
     db = DatabaseManager(DB_PATH)
-    # Fetch only completed training runs
     training_runs = db.get_all_runs(run_type='Training')
     db.close()
     
-    # Filter for runs that have a final model saved
     valid_models = [
         run for run in training_runs 
         if run['status'] == 'COMPLETED' and (REPORTS_DIR / str(run['run_id']) / 'final_model').exists()
@@ -71,7 +69,6 @@ with col1:
         st.error("No trained models found. Please train a model first on the 'Train & Evaluate' page.")
         st.stop()
 
-    # Create a list of nicknames for the selectbox
     model_options = {run['nickname']: run['run_id'] for run in trained_models}
     selected_nickname = st.selectbox("Select a Trained Model by Nickname", options=list(model_options.keys()), disabled=is_any_task_running, label_visibility="collapsed")
     selected_run_id = model_options.get(selected_nickname)
@@ -81,11 +78,14 @@ with col1:
     uploaded_file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed", disabled=is_any_task_running)
     
     st.subheader("3. Select Mode")
-    evaluate_mode = st.checkbox("Evaluate with detailed metrics (requires 'Label' column in CSV)", value=False, disabled=is_any_task_running)
-    mode_str = "testing" if evaluate_mode else "inference"
-    task_type_str = "Testing" if evaluate_mode else "Inference"
+    
+    evaluate_mode_checked = st.checkbox("Evaluate with detailed metrics (requires 'Label' column in CSV)", value=False, disabled=is_any_task_running)
+    
+    mode_str = "testing" if evaluate_mode_checked else "inference"
+    task_type_str = "Testing" if evaluate_mode_checked else "Inference"
 
-    batch_size = st.number_input("Inference Batch Size", min_value=1, max_value=512, value=32, help="Number of sequences to process at once. Larger is faster but uses more VRAM.", disabled=is_any_task_running)
+    # --- FIX: Set default batch size to 8 ---
+    batch_size = st.number_input("Inference Batch Size", min_value=1, max_value=512, value=8, help="Number of sequences to process at once. Larger is faster but uses more VRAM.", disabled=is_any_task_running)
     
     st.subheader("4. Launch Run")
     if st.button(f"🚀 Launch {task_type_str} Run", type="primary", use_container_width=True, disabled=is_any_task_running):

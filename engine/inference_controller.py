@@ -12,7 +12,7 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, roc_curve, auc
 
 from config import REPORTS_DIR, DEFAULT_BERT_PATH, MODELS_DIR
-from utils.data_loader import LogDataset, replace_patterns
+from utils.data_loader import LogDataset
 from utils.model_loader import load_model_and_tokenizer
 from utils.helpers import merge_data, stack_and_pad_left, safe_np_array
 from transformers import AutoTokenizer, AutoModel, AutoConfig
@@ -89,7 +89,7 @@ class InferenceController:
         self._log("Phase 1 Complete. BERT and Projector released from memory.")
         return num_sequence_batches
 
-    def _run_llama_phase(self, dataset, temp_embedding_dir, num_batches):
+    def _run_llama_phase(self, temp_embedding_dir, num_batches, sequence_batch_size):
         self._log("Phase 2: Starting Llama classification.")
         llama_model, llama_tokenizer = load_model_and_tokenizer(self.model_name, is_train_mode=False)
         model_dtype = llama_model.dtype
@@ -97,30 +97,43 @@ class InferenceController:
         classifier = nn.Linear(llama_model.config.hidden_size, 2).to(self.device).to(model_dtype).eval()
         classifier.load_state_dict(torch.load(os.path.join(self.ft_path, 'classifier.pt'), map_location=self.device))
         instruc_tokens = llama_tokenizer(['Below is a sequence of system log messages:'], return_tensors="pt", padding=True).to(self.device)
-        all_preds, all_probas, processed_rows, total_rows = [], [], 0, len(dataset)
+        all_preds, all_probas, all_indices = [], [], []
+
         with torch.inference_mode():
             for i in tqdm(range(num_batches), desc="Llama Phase"):
                 batch_data = torch.load(os.path.join(temp_embedding_dir, f"batch_{i}.pt"))
                 projected_outputs = batch_data['data'].to(self.device).to(model_dtype)
                 start_positions = batch_data['pos']
                 if not start_positions: continue
+                
                 seq_embeddings = list(torch.tensor_split(projected_outputs, start_positions[1:], dim=0)) if len(start_positions) > 1 else [projected_outputs]
                 embed_layer = llama_model.get_input_embeddings(); instruc_embeds = embed_layer(instruc_tokens['input_ids'])
-                valid_embeddings = [torch.cat([instruc_embeds[0], se], dim=0) for se in seq_embeddings if se is not None and se.shape[0] > 0]
-                if not valid_embeddings:
-                    processed_rows += len(seq_embeddings); continue
+                
+                valid_embeddings, original_indices_in_batch = [], []
+                for j, se in enumerate(seq_embeddings):
+                    if se is not None and se.shape[0] > 0:
+                        valid_embeddings.append(torch.cat([instruc_embeds[0], se], dim=0))
+                        original_indices_in_batch.append(j)
+
+                if not valid_embeddings: continue
+
                 inputs_embeds, attention_mask = stack_and_pad_left(valid_embeddings)
                 outputs = llama_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
                 sequence_lengths = attention_mask.sum(dim=1) - 1
                 cls_input_hidden_state = outputs.hidden_states[-1][torch.arange(len(valid_embeddings), device=self.device), sequence_lengths]
                 probas = torch.softmax(classifier(cls_input_hidden_state), dim=-1)
+                
                 all_preds.extend(torch.argmax(probas, dim=-1).cpu().numpy())
                 all_probas.extend(probas[:, 1].cpu().numpy())
-                processed_rows += len(seq_embeddings)
-                if self._update_progress(processed_rows, total_rows, self.run_start_time) == "STOP": raise InterruptedError("Stop request received.")
+
+                batch_start_index = i * sequence_batch_size
+                global_indices = [batch_start_index + local_idx for local_idx in original_indices_in_batch]
+                all_indices.extend(global_indices)
+
         del llama_model, classifier, llama_tokenizer; gc.collect(); torch.cuda.empty_cache()
         self._log("Phase 2 Complete. Llama and Classifier released from memory.")
-        return all_preds, all_probas
+        return all_preds, all_probas, all_indices
+
 
     def run(self, input_file_path: str, mode: str, internal_batch_size: int = 32):
         from utils.resource_monitor import ResourceMonitor; from utils.log_visualizer import LogVisualizer
@@ -132,26 +145,44 @@ class InferenceController:
         visualizer = LogVisualizer(plot_dir=report_dir); monitor = ResourceMonitor(); monitor.start()
         temp_embedding_dir = tempfile.mkdtemp(); final_status, results = 'FAILED', None
         try:
-            dataset = LogDataset(input_file_path)
+            dataset = LogDataset(file_path=input_file_path)
             if mode == 'testing' and (dataset.labels == -1).all(): raise ValueError("Testing mode requires a 'Label' column.")
             num_batches = self._run_bert_phase(dataset, temp_embedding_dir, internal_batch_size)
-            all_preds, all_probas = self._run_llama_phase(dataset, temp_embedding_dir, num_batches)
-            total_run_time, total_records = time.time() - self.run_start_time, len(dataset)
-            time_per_record_ms = (total_run_time / total_records) * 1000 if total_records > 0 else 0
+            all_preds, all_probas, processed_indices = self._run_llama_phase(temp_embedding_dir, num_batches, internal_batch_size)
+            
+            total_run_time = time.time() - self.run_start_time
+            # --- FIX: Calculate time_per_record using the number of PROCESSED records ---
+            num_processed_records = len(processed_indices)
+            time_per_record_ms = (total_run_time / num_processed_records) * 1000 if num_processed_records > 0 else 0
+            
             perf_metrics = { "overall": { "total_run_time_sec": total_run_time, "time_per_record_ms": time_per_record_ms } }
+            
             if mode == 'testing':
-                gt_labels = dataset.get_all_labels()
-                preds_numeric, probas_numeric, gt_numeric = safe_np_array(all_preds), safe_np_array(all_probas), gt_labels
-                p, r, f1, _ = precision_recall_fscore_support(gt_numeric, preds_numeric, average='binary', pos_label=1, zero_division=0)
-                perf_metrics["overall"].update({ "accuracy": accuracy_score(gt_numeric, preds_numeric), "precision": p, "recall": r, "f1_score": f1 })
-                visualizer.plot_confusion_matrix(confusion_matrix(gt_numeric, preds_numeric), ['Normal', 'Anomalous'])
-                visualizer.plot_roc_curve(gt_numeric, probas_numeric)
-                visualizer.plot_overall_metrics({k: v for k, v in perf_metrics['overall'].items() if k in ['accuracy', 'precision', 'recall', 'f1_score']})
+                all_gt_labels = dataset.get_all_labels()
+                gt_labels_for_preds = all_gt_labels[processed_indices]
+                
+                preds_numeric, probas_numeric = safe_np_array(all_preds), safe_np_array(all_probas)
+                p, r, f1, _ = precision_recall_fscore_support(gt_labels_for_preds, preds_numeric, average='binary', pos_label=1, zero_division=0)
+                
+                perf_metrics["overall"].update({ "accuracy": accuracy_score(gt_labels_for_preds, preds_numeric), "precision": p, "recall": r, "f1_score": f1 })
+                
+                visualizer.plot_confusion_matrix(confusion_matrix(gt_labels_for_preds, preds_numeric), ['Normal', 'Anomalous'])
+                visualizer.plot_roc_curve(gt_labels_for_preds, probas_numeric)
+                visualizer.plot_overall_metrics(perf_metrics['overall'])
+            
             else:
-                df = pd.read_csv(input_file_path); df['Prediction'] = ["Anomalous" if p == 1 else "Normal" for p in all_preds]; df['Confidence'] = all_probas
+                df = pd.read_csv(input_file_path)
+                df['Prediction'] = "Skipped"
+                df['Confidence'] = 0.0
+                
+                pred_labels = ["Anomalous" if p == 1 else "Normal" for p in all_preds]
+                df.loc[processed_indices, 'Prediction'] = pred_labels
+                df.loc[processed_indices, 'Confidence'] = all_probas
+                
                 output_csv_path = report_dir / f"inference_results_{self.run_id}.csv"; df.to_csv(output_csv_path, index=False)
                 results = str(output_csv_path)
-                perf_metrics["overall"]["total_rows"] = total_records
+                perf_metrics["overall"]["total_rows"] = len(dataset)
+            
             self.db.save_performance_metrics(self.run_id, perf_metrics)
             final_status = 'COMPLETED'
         except InterruptedError:

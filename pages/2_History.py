@@ -15,6 +15,16 @@ def format_duration(seconds):
     seconds = int(seconds); hours, remainder = divmod(seconds, 3600); minutes, seconds = divmod(remainder, 60)
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
+# --- FIX: New robust function to display a metric block ---
+def display_metric_block(title, metrics_data):
+    st.subheader(title)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Accuracy", f"{metrics_data.get('accuracy', 0):.4f}")
+    c2.metric("Precision", f"{metrics_data.get('precision', 0):.4f}")
+    c3.metric("Recall", f"{metrics_data.get('recall', 0):.4f}")
+    c4.metric("F1-Score", f"{metrics_data.get('f1_score', 0):.4f}")
+    st.divider()
+
 st.title("📜 Run History")
 st.write("Review details, metrics, and reports from past training, testing, and inference runs.")
 
@@ -30,6 +40,7 @@ with tab1:
         st.info("No runs found in the database. Please start a new run from the other pages.")
     else:
         df_runs = pd.DataFrame(all_runs)
+        
         if 'page_number' not in st.session_state: st.session_state.page_number = 0
         if 'selected_run_id_for_view' not in st.session_state: st.session_state.selected_run_id_for_view = None
 
@@ -92,8 +103,8 @@ with tab2:
         for run in training_runs:
             if run['status'] == 'COMPLETED':
                 details = db.get_run_details(run['run_id'])
-                if details and details.get('performance_metrics', {}).get('overall'):
-                    p_metrics = details['performance_metrics']['overall']
+                if details and details.get('performance_metrics', {}).get('test', {}).get('overall'):
+                    p_metrics = details['performance_metrics']['test']['overall']
                     entry = {
                         'ID': run['run_id'],
                         'Nickname': run['nickname'],
@@ -106,8 +117,9 @@ with tab2:
                     perf_data.append(entry)
         
         if not perf_data:
-            st.info("No completed training runs with metrics found.")
+            st.info("No completed training runs with test metrics found.")
         else:
+            st.subheader("Final Test Set Performance")
             df_perf = pd.DataFrame(perf_data)
             st.dataframe(
                 df_perf,
@@ -132,14 +144,44 @@ if st.session_state.selected_run_id_for_view:
             st.subheader(f"Details for Run: `{info.get('nickname', info.get('run_id'))}`")
             if st.button("Close Details"): st.session_state.selected_run_id_for_view = None; st.rerun()
             duration = info.get('end_time', 0) - info.get('start_time', 0) if info.get('end_time') else None
+            
+            is_test_run_info = h_params.get('is_test_run', False)
+            if is_test_run_info:
+                test_perc = h_params.get('test_run_percentage', 0.3) * 100
+                st.info(f"This was a **Quick Test Run** using {test_perc:.0f}% of the data.")
+
             summary_cols = st.columns(4); summary_cols[0].metric("Run Type", info.get('run_type')); summary_cols[1].metric("Status", info.get('status')); summary_cols[2].metric("Start Time", time.strftime('%H:%M:%S', time.localtime(info.get('start_time')))); summary_cols[3].metric("Total Duration", format_duration(duration))
             with st.expander("📊 Performance Metrics", expanded=True):
-                if p_metrics and 'overall' in p_metrics:
-                    overall = p_metrics.get('overall', {});
-                    if info.get('run_type') in ['Training', 'Testing']:
-                        st.subheader("Classification Results"); c1, c2, c3, c4 = st.columns(4); c1.metric("Accuracy", f"{overall.get('accuracy', 0):.4f}"); c2.metric("Precision", f"{overall.get('precision', 0):.4f}"); c3.metric("Recall", f"{overall.get('recall', 0):.4f}"); c4.metric("F1-Score", f"{overall.get('f1_score', 0):.4f}")
-                    st.divider(); st.subheader("Processing Speed"); timing_cols = st.columns(2); timing_cols[0].metric("Total Run Time", f"{overall.get('total_run_time_sec', 0):.2f}s"); timing_cols[1].metric("Time / Record", f"{overall.get('time_per_record_ms', 0):.2f} ms")
-                else: st.warning("No performance metrics available.")
+                if p_metrics:
+                    has_displayed_metrics = False
+                    
+                    # Training Run Metrics
+                    if 'validation' in p_metrics and 'overall' in p_metrics['validation']:
+                        display_metric_block("Validation Set", p_metrics['validation']['overall'])
+                        has_displayed_metrics = True
+                    if 'test' in p_metrics and 'overall' in p_metrics['test']:
+                        display_metric_block("Test Set", p_metrics['test']['overall'])
+                        has_displayed_metrics = True
+                    
+                    # Standalone Testing/Inference Run Metrics
+                    if 'overall' in p_metrics and 'accuracy' in p_metrics['overall']:
+                        display_metric_block("Classification Results", p_metrics['overall'])
+                        has_displayed_metrics = True
+                    
+                    # Always display timing info if available
+                    if 'overall' in p_metrics and 'total_run_time_sec' in p_metrics['overall']:
+                        st.subheader("Processing Speed")
+                        timing_metrics = p_metrics['overall']
+                        timing_cols = st.columns(2)
+                        timing_cols[0].metric("Total Run Time", f"{timing_metrics.get('total_run_time_sec', 0):.2f}s")
+                        timing_cols[1].metric("Time / Record", f"{timing_metrics.get('time_per_record_ms', 0):.2f} ms")
+                        has_displayed_metrics = True
+
+                    if not has_displayed_metrics:
+                        st.warning("No classification or timing metrics available for this run.")
+                else:
+                     st.warning("No performance metrics available.")
+
             with st.expander("🛠️ Resource Metrics", expanded=True):
                 if r_metrics and 'summary' in r_metrics:
                     summary = r_metrics.get('summary', {}); cpu, ram, gpu = summary.get('cpu', {}), summary.get('ram', {}), summary.get('gpu', {})
@@ -158,15 +200,34 @@ if st.session_state.selected_run_id_for_view:
                              csv_files = list(report_dir.glob("*.csv"));
                              if csv_files:
                                 with open(csv_files[0], "rb") as fp: st.download_button("Download Results CSV", fp, csv_files[0].name, "text/csv")
-                        plot_files = { 'training_loss.png': "Shows the batch loss over the course of the training run.", 'confusion_matrix.png': "Compares predicted labels to true labels.", 'roc_curve.png': "Plots true positive rate against false positive rate.", 'overall_metrics.png': "A bar chart summarizing the key classification metrics.", 'cpu_usage.png': "Tracks the CPU utilization percentage over the duration of the run.", 'ram_usage.png': "Tracks RAM consumption in Gigabytes (GB) over the duration of the run.", 'gpu_utilization.png': "Tracks GPU processing utilization percentage over time.", 'gpu_memory.png': "Tracks dedicated GPU Memory (VRAM) consumption over time." }
+                        
+                        plot_files = {
+                            'training_loss.png': "Shows the batch loss over the course of the training run.",
+                            'test_confusion_matrix.png': "Compares predicted labels to true labels on the Test set.",
+                            'validation_confusion_matrix.png': "Compares predicted labels to true labels on the Validation set.",
+                            'test_roc_curve.png': "Plots true positive rate against false positive rate on the Test set.",
+                            'validation_roc_curve.png': "Plots true positive rate against false positive rate on the Validation set.",
+                            'test_overall_metrics.png': "A bar chart summarizing key metrics on the Test set.",
+                            'validation_overall_metrics.png': "A bar chart summarizing key metrics on the Validation set.",
+                            'confusion_matrix.png': "Compares predicted labels to true labels.",
+                            'roc_curve.png': "Plots true positive rate against false positive rate.",
+                            'overall_metrics.png': "A bar chart summarizing key classification metrics.",
+                            'cpu_usage.png': "Tracks CPU utilization percentage over the duration of the run.",
+                            'ram_usage.png': "Tracks RAM consumption in Gigabytes (GB) over the duration of the run.",
+                            'gpu_utilization.png': "Tracks GPU processing utilization percentage over time.",
+                            'gpu_memory.png': "Tracks dedicated GPU Memory (VRAM) consumption over time."
+                        }
+                        
                         image_paths = []
                         for filename, caption in plot_files.items():
                             path = report_dir / filename
-                            if path.exists(): image_paths.append((str(path), caption))
+                            if path.exists() and path not in [p for p, c in image_paths]: 
+                                image_paths.append((path, caption))
+
                         if image_paths:
                             plot_cols = st.columns(2)
                             for i, (path, caption) in enumerate(image_paths):
-                                with plot_cols[i % 2]: st.image(path, use_container_width=True, caption=caption)
+                                with plot_cols[i % 2]: st.image(str(path), use_container_width=True, caption=caption)
                         else: st.info("No plot images found in the report directory.")
                 else: st.warning("No report or visualizations available for this run.")
 

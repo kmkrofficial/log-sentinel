@@ -23,7 +23,6 @@ def reset_global_state():
             "done": False,
         })
         st.session_state.stop_button_clicked = False
-        # General cleanup for any temp file stored in session state
         for key in list(st.session_state.keys()):
             if 'temp_file_path' in key:
                 temp_path = st.session_state.pop(key, None)
@@ -54,29 +53,33 @@ def render_run_status(task_type: str):
     if is_this_task_running:
         progress_info = GLOBAL_APP_STATE.get("latest_progress", {})
         
-        # Determine progress text and value
         progress = progress_info.get("progress", 0)
         clamped_progress = min(progress, 1.0)
         progress_text = f"{clamped_progress:.1%}"
 
-        # Display progress bar and metrics
-        st.text(progress_text)
+        st.text(f"Overall Progress: {progress_text}")
         st.progress(clamped_progress)
         
-        # Display relevant metrics based on task type
         if task_type == "Training":
             epoch = progress_info.get("epoch", "Starting...")
             loss = progress_info.get("loss", 0)
             st.text(f"Current Phase: {epoch}")
             st.text(f"Batch Loss: {loss:.4f}")
-        else: # For Inference and Testing
+
+            # --- FIX: Display all three time metrics ---
+            time_elapsed = progress_info.get("time_elapsed", 0)
+            etc_phase = progress_info.get("etc_phase", 0)
+            etc_overall = progress_info.get("etc_overall", 0)
+            st.text(f"Time Elapsed:  {format_time(time_elapsed)}")
+            st.text(f"Phase ETC:     {format_time(etc_phase)}")
+            st.text(f"Overall ETC:   {format_time(etc_overall)}")
+
+        else:
             rows = progress_info.get("rows_processed", 0)
             st.text(f"Rows Processed: {rows:,}")
+            etc = progress_info.get("etc", 0)
+            st.text(f"ETC: {format_time(etc)}")
 
-        etc = progress_info.get("etc", 0)
-        st.text(f"ETC: {format_time(etc)}")
-
-        # Add the stop button
         if 'stop_button_clicked' not in st.session_state:
             st.session_state.stop_button_clicked = False
 
@@ -86,20 +89,18 @@ def render_run_status(task_type: str):
             st.warning("Stop request sent. The process will abort on the next step.")
             st.rerun()
 
-        # Display logs and errors
         with st.expander("Show Live Logs", expanded=True):
             st.code(
                 '\n'.join(GLOBAL_APP_STATE.get("log_buffer", [])),
                 language='log',
-                height=450 # Adjusted height for the button
+                height=300
             )
         
         if error := GLOBAL_APP_STATE.get("error"):
             st.error(f"An error occurred: {error}")
         
-        # Rerun to update UI
         if not GLOBAL_APP_STATE.get("done", False):
             time.sleep(2)
             st.rerun()
     else:
-        st.info("Status of the run will be displayed here once started.")
+        st.info("Status of a run will be displayed here once started.")

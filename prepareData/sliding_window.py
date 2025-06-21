@@ -8,11 +8,11 @@ from helper import sliding_window, fixedSize_window, structure_log
 #### for Thunderbird, Liberty, BGL
 
 
-data_dir = r'E:\research-stuff\LogLLM-3b\dataset'
+data_dir = r'E:\research-stuff\LogSentinel-3b\datasets\BGL'
 log_name = "bgl2"
 
 start_line = 0
-end_line = 1000000
+end_line = 100000000
 
 # # Liberty
 # start_line = 40000000
@@ -54,6 +54,8 @@ if __name__ == '__main__':
     print(f'window_size: {window_size}; step_size: {step_size}')
 
     train_ratio = 0.8
+    # --- NEW: Define the ratio for the validation split from the training pool ---
+    validation_ratio = 0.1 # 10% of the training pool will become the validation set
 
     df = pd.read_csv(os.path.join(output_dir,f'{log_name}_structured.csv'))
 
@@ -68,18 +70,30 @@ if __name__ == '__main__':
     #     df['deltaT'] = df['datetime'].diff() / np.timedelta64(1, 's')
     #     df['deltaT'].fillna(0)
 
-    train_len = int(train_ratio*len(df))
-
-    df_train = df[:train_len]
-
-    df_test = df[train_len:]
+    # --- MODIFIED: Split into a training/validation pool and a test set first ---
+    train_pool_len = int(train_ratio*len(df))
+    df_train_pool = df[:train_pool_len]
+    df_test = df[train_pool_len:]
     df_test = df_test.reset_index(drop=True)
+
+    # --- NEW: Split the training pool into the final train and validation sets ---
+    train_len = int((1 - validation_ratio) * len(df_train_pool))
+    df_train = df_train_pool[:train_len]
+    df_validation = df_train_pool[train_len:]
+    df_validation = df_validation.reset_index(drop=True)
+
 
     print('Start grouping.')
 
     # grouping with fixedSize window
     session_train_df = fixedSize_window(
         df_train[['Content', 'Label']],
+        window_size=window_size, step_size=step_size
+    )
+
+    # --- NEW: Create session dataframe for the validation set ---
+    session_validation_df = fixedSize_window(
+        df_validation[['Content', 'Label']],
         window_size=window_size, step_size=step_size
     )
 
@@ -124,6 +138,16 @@ if __name__ == '__main__':
     num_anomalous_train= session_train_df['Label'].sum()
     num_normal_train = len(session_train_df['Label']) - session_train_df['Label'].sum()
 
+    # --- NEW: Process the validation dataframe ---
+    session_validation_df = session_validation_df[col]
+    session_validation_df['session_length'] = session_validation_df["Content"].apply(len)
+    session_validation_df["Content"] = session_validation_df["Content"].apply(lambda x: spliter.join(x))
+
+    mean_session_validation_len = session_validation_df['session_length'].mean()
+    max_session_validation_len = session_validation_df['session_length'].max()
+    num_anomalous_validation = session_validation_df['Label'].sum()
+    num_normal_validation = len(session_validation_df['Label']) - session_validation_df['Label'].sum()
+
     session_test_df = session_test_df[col]
     session_test_df['session_length'] = session_test_df["Content"].apply(len)
     session_test_df["Content"] = session_test_df["Content"].apply(lambda x: spliter.join(x))
@@ -135,23 +159,32 @@ if __name__ == '__main__':
 
 
     session_train_df.to_csv(os.path.join(output_dir, 'train.csv'),index=False)
+    # --- NEW: Save the validation set to its own file ---
+    session_validation_df.to_csv(os.path.join(output_dir, 'validation.csv'), index=False)
     session_test_df.to_csv(os.path.join(output_dir, 'test.csv'),index=False)
 
     print('Train dataset info:')
     print(f"max session length: {max_session_train_len}; mean session length: {mean_session_train_len}\n")
     print(f"number of anomalous sessions: {num_anomalous_train}; number of normal sessions: {num_normal_train}; number of total sessions: {len(session_train_df['Label'])}\n")
 
+    # --- NEW: Print info for the validation set ---
+    print('Validation dataset info:')
+    print(f"max session length: {max_session_validation_len}; mean session length: {mean_session_validation_len}\n")
+    print(f"number of anomalous sessions: {num_anomalous_validation}; number of normal sessions: {num_normal_validation}; number of total sessions: {len(session_validation_df['Label'])}\n")
+
     print('Test dataset info:')
     print(f"max session length: {max_session_test_len}; mean session length: {mean_session_test_len}\n")
     print(f"number of anomalous sessions: {num_anomalous_test}; number of normal sessions: {num_normal_test}; number of total sessions: {len(session_test_df['Label'])}\n")
 
     with open(os.path.join(output_dir, 'train_info.txt'), 'w') as file:
-        # 写入内容到文件
         file.write(f"max session length: {max_session_train_len}; mean session length: {mean_session_train_len}\n")
         file.write(f"number of anomalous sessions: {num_anomalous_train}; number of normal sessions: {num_normal_train}; number of total sessions: {len(session_train_df['Label'])}\n")
 
+    # --- NEW: Write info file for the validation set ---
+    with open(os.path.join(output_dir, 'validation_info.txt'), 'w') as file:
+        file.write(f"max session length: {max_session_validation_len}; mean session length: {mean_session_validation_len}\n")
+        file.write(f"number of anomalous sessions: {num_anomalous_validation}; number of normal sessions: {num_normal_validation}; number of total sessions: {len(session_validation_df['Label'])}\n")
+
     with open(os.path.join(output_dir, 'test_info.txt'), 'w') as file:
-        # 写入内容到文件
         file.write(f"max session length: {max_session_test_len}; mean session length: {mean_session_test_len}\n")
         file.write(f"number of anomalous sessions: {num_anomalous_test}; number of normal sessions: {num_normal_test}; number of total sessions: {len(session_test_df['Label'])}\n")
-

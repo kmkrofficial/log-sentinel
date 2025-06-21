@@ -10,34 +10,44 @@ class LogVisualizer:
         self.plot_dir.mkdir(parents=True, exist_ok=True)
         self.plot_paths = {}
 
-    def _save_plot(self, fig, filename):
-        path = self.plot_dir / filename
+    # --- FIX: Added filename_prefix to save plots with context (e.g., validation_ vs test_) ---
+    def _save_plot(self, fig, filename, filename_prefix=None):
+        base_filename = f"{filename_prefix}_" if filename_prefix else ""
+        base_filename += filename
+        
+        path = self.plot_dir / base_filename
         fig.tight_layout()
         fig.savefig(path)
         plt.close(fig)
-        self.plot_paths[filename.split('.')[0]] = str(path)
+        self.plot_paths[base_filename.split('.')[0]] = str(path)
         print(f"Saved plot: {path}")
 
-    def plot_confusion_matrix(self, cm, class_names):
+    def plot_confusion_matrix(self, cm, class_names, filename_prefix=None):
         fig, ax = plt.subplots(figsize=(8, 6))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, xticklabels=class_names, yticklabels=class_names)
         ax.set_xlabel('Predicted Label')
         ax.set_ylabel('True Label')
-        ax.set_title('Confusion Matrix')
-        self._save_plot(fig, 'confusion_matrix.png')
+        title = f'Confusion Matrix'
+        if filename_prefix:
+            title += f' ({filename_prefix.capitalize()})'
+        ax.set_title(title)
+        self._save_plot(fig, 'confusion_matrix.png', filename_prefix)
 
-    def plot_overall_metrics(self, metrics):
+    def plot_overall_metrics(self, metrics, filename_prefix=None):
         fig, ax = plt.subplots(figsize=(8, 5))
         bars = ax.bar(metrics.keys(), metrics.values(), color=['skyblue', 'lightcoral', 'lightgreen', 'gold'])
         ax.set_ylabel('Score')
-        ax.set_title('Overall Classification Metrics')
+        title = 'Overall Classification Metrics'
+        if filename_prefix:
+            title += f' ({filename_prefix.capitalize()})'
+        ax.set_title(title)
         ax.set_ylim(0, 1.1)
         for bar in bars:
             yval = bar.get_height()
             ax.text(bar.get_x() + bar.get_width()/2.0, yval, f'{yval:.4f}', va='bottom', ha='center')
-        self._save_plot(fig, 'overall_metrics.png')
+        self._save_plot(fig, 'overall_metrics.png', filename_prefix)
     
-    def plot_roc_curve(self, y_true, y_pred_proba):
+    def plot_roc_curve(self, y_true, y_pred_proba, filename_prefix=None):
         fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
         roc_auc = auc(fpr, tpr)
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -47,17 +57,19 @@ class LogVisualizer:
         ax.set_ylim([0.0, 1.05])
         ax.set_xlabel('False Positive Rate')
         ax.set_ylabel('True Positive Rate')
-        ax.set_title('Receiver Operating Characteristic (ROC) Curve')
+        title = 'Receiver Operating Characteristic (ROC) Curve'
+        if filename_prefix:
+            title += f' ({filename_prefix.capitalize()})'
+        ax.set_title(title)
         ax.legend(loc="lower right")
         ax.grid(True)
-        self._save_plot(fig, 'roc_curve.png')
+        self._save_plot(fig, 'roc_curve.png', filename_prefix)
 
     def plot_training_loss(self, loss_data):
         if not loss_data:
             return
         fig, ax = plt.subplots(figsize=(12, 6))
         ax.plot(range(len(loss_data)), loss_data, label='Batch Loss')
-        # Simple moving average to show the trend
         if len(loss_data) > 100:
             moving_avg = np.convolve(loss_data, np.ones(100)/100, mode='valid')
             ax.plot(np.arange(99, len(loss_data)), moving_avg, color='red', linestyle='--', label='100-step Moving Avg')
@@ -66,7 +78,7 @@ class LogVisualizer:
         ax.set_title('Training Loss Over Time')
         ax.legend()
         ax.grid(True)
-        self._save_plot(fig, 'training_loss.png')
+        self._save_plot(fig, 'training_loss.png') # No prefix needed for this one
 
     def plot_resource_usage(self, resource_metrics):
         ts_data = resource_metrics.get('time_series', {})

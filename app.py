@@ -1,7 +1,6 @@
 import streamlit as st
-from pathlib import Path
 
-# Set Streamlit page configuration
+# Set the global page configuration for the entire app
 st.set_page_config(
     page_title="LogSentinel",
     page_icon="🛡️",
@@ -9,32 +8,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Main App Content ---
-st.title("🛡️ LogSentinel: Edge-Optimized Anomaly Detection")
-st.markdown("---")
-
-st.header("Welcome to LogSentinel")
-
-st.write("""
-This application provides a complete toolkit for training, evaluating, and deploying
-log anomaly detection models based on the LogLLM architecture, optimized for
-resource-constrained environments.
-
-**Navigate using the sidebar to:**
-- **Train & Evaluate:** Launch a new training run with custom models and datasets.
-- **View History:** Review detailed reports and metrics from past training runs.
-- **Inference:** Perform real-time anomaly detection on log sequences.
-""")
-
-# --- Instructions for setup ---
-st.info("""
-**Getting Started:**
-1.  Ensure you have placed your datasets in the `datasets/` directory. Each dataset should have its own folder (e.g., `datasets/BGL/`) containing `train.csv` and `test.csv`.
-2.  Pre-downloaded models can be placed in the `models/` directory.
-3.  Use the `run_training.py` script for command-line training or use the **Train & Evaluate** page to start a run from the UI.
-""")
-
-# --- Hide Streamlit default footer ---
+# --- Hide Streamlit default footer and hamburger menu ---
 hide_streamlit_style = """
             <style>
             #MainMenu {visibility: hidden;}
@@ -42,3 +16,7 @@ hide_streamlit_style = """
             </style>
             """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+
+# Immediately switch to the landing page.
+# The user will not see this page, it's just a host.
+st.switch_page("pages/0_Landing.py")

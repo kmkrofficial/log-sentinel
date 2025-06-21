@@ -1,42 +1,25 @@
 import torch
 import os
 from torch import nn
-from peft import (
-    PeftModel,
-    LoraConfig,
-    TaskType,
-    get_peft_model,
-    prepare_model_for_kbit_training
-)
-from transformers import AutoTokenizer, AutoModel, AutoConfig
+from peft import PeftModel, LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from transformers import AutoConfig
 from utils.model_loader import load_model_and_tokenizer
-from utils.helpers import merge_data, stack_and_pad_left
+from utils.helpers import stack_and_pad_left
+import traceback # Import traceback for detailed error logging
 
 class LogSentinelModel(nn.Module):
-    def __init__(self, bert_path, llama_path, ft_path=None, is_train_mode=True, device=None, max_content_len=128, max_seq_len=128):
+    def __init__(self, llama_path, encoder_hidden_size, ft_path=None, is_train_mode=True, device=None):
         super().__init__()
-        self.max_content_len = max_content_len
-        self.max_seq_len = max_seq_len
         self.device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         self.llama_model, self.llama_tokenizer = load_model_and_tokenizer(llama_path, is_train_mode)
-        
-        bert_model_path = bert_path.parent / bert_path.name
-        self.bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_path)
-        self.bert_model = AutoModel.from_pretrained(
-            bert_model_path,
-            low_cpu_mem_usage=True
-        ).to(self.device)
-        if hasattr(self.bert_model.config, 'gradient_checkpointing') and self.bert_model.config.gradient_checkpointing:
-             self.bert_model.gradient_checkpointing_enable()
 
         projector_device = self.llama_model.device
         compute_dtype = self.llama_model.dtype
-        bert_hidden_size = self.bert_model.config.hidden_size
         llama_hidden_size = self.llama_model.config.hidden_size
 
         self.projector = nn.Sequential(
-            nn.Linear(bert_hidden_size, llama_hidden_size),
+            nn.Linear(encoder_hidden_size, llama_hidden_size),
             nn.GELU(),
             nn.Linear(llama_hidden_size, llama_hidden_size)
         ).to(projector_device).to(compute_dtype)
@@ -51,35 +34,45 @@ class LogSentinelModel(nn.Module):
         self._setup_peft(ft_path, is_train_mode)
 
     def _setup_peft(self, ft_path, is_train_mode):
-        if ft_path and os.path.exists(os.path.join(ft_path, 'adapter_config.json')):
-            print(f"Loading components from fine-tuned path: {ft_path}")
-            self.llama_model = PeftModel.from_pretrained(self.llama_model, os.path.join(ft_path, 'Llama_ft'), is_trainable=is_train_mode)
-            self.projector.load_state_dict(torch.load(os.path.join(ft_path, 'projector.pt')))
-            self.classifier.load_state_dict(torch.load(os.path.join(ft_path, 'classifier.pt')))
-            print("PEFT adapter and other components loaded for inference/continued training.")
-        elif is_train_mode:
-            print("No adapter found. Creating new PEFT configuration for training.")
-            if getattr(self.llama_model, "is_loaded_in_8bit", False) or getattr(self.llama_model, "is_loaded_in_4bit", False):
-                self.llama_model = prepare_model_for_kbit_training(self.llama_model)
-            
-            lora_config = LoraConfig(
-                r=32,
-                lora_alpha=64,
-                lora_dropout=0.1,
-                target_modules=["q_proj", "v_proj"],
-                bias="none", task_type=TaskType.CAUSAL_LM
-            )
-            self.llama_model = get_peft_model(self.llama_model, lora_config)
-            self.llama_model.print_trainable_parameters()
-        else:
-            print("Warning: Inference mode selected but no fine-tuned adapter path was provided.")
+        try:
+            if ft_path and os.path.exists(os.path.join(ft_path, 'Llama_ft', 'adapter_config.json')):
+                self._log(f"Found existing adapter at {ft_path}. Loading...")
+                self.llama_model = PeftModel.from_pretrained(self.llama_model, os.path.join(ft_path, 'Llama_ft'), is_trainable=is_train_mode)
+                self._log("PEFT adapter loaded successfully.")
+                
+                projector_path = os.path.join(ft_path, 'projector.pt')
+                classifier_path = os.path.join(ft_path, 'classifier.pt')
+                if os.path.exists(projector_path):
+                    self.projector.load_state_dict(torch.load(projector_path, map_location=self.device))
+                    self._log("Projector weights loaded.")
+                if os.path.exists(classifier_path):
+                    self.classifier.load_state_dict(torch.load(classifier_path, map_location=self.device))
+                    self._log("Classifier weights loaded.")
+
+            elif is_train_mode:
+                self._log("No adapter found. Creating new PEFT configuration for training.")
+                if getattr(self.llama_model, "is_loaded_in_8bit", False) or getattr(self.llama_model, "is_loaded_in_4bit", False):
+                    self.llama_model = prepare_model_for_kbit_training(self.llama_model, use_gradient_checkpointing=True)
+                lora_config = LoraConfig(r=32, lora_alpha=64, lora_dropout=0.1, target_modules=["q_proj", "v_proj"], bias="none", task_type=TaskType.CAUSAL_LM)
+                self.llama_model = get_peft_model(self.llama_model, lora_config)
+                self.llama_model.print_trainable_parameters()
+            else:
+                self._log("Warning: Evaluation mode selected but no fine-tuned adapter path was provided. Using base model only.")
+        except Exception as e:
+            # --- FIX: Add detailed traceback logging to model setup ---
+            self._log(f"FATAL: An error occurred during PEFT setup in LogSentinelModel.")
+            self._log(traceback.format_exc())
+            raise e
+
+    def _log(self, message):
+        print(message)
 
     def save_ft_model(self, path):
         os.makedirs(path, exist_ok=True)
         self.llama_model.save_pretrained(os.path.join(path, 'Llama_ft'))
         torch.save(self.projector.state_dict(), os.path.join(path, 'projector.pt'))
         torch.save(self.classifier.state_dict(), os.path.join(path, 'classifier.pt'))
-        print(f"Fine-tuned adapter and components saved to {path}")
+        self._log(f"Fine-tuned adapter and components saved to {path}")
 
     def _set_trainable(self, **kwargs):
         for name, param in self.named_parameters():
@@ -93,76 +86,37 @@ class LogSentinelModel(nn.Module):
     def set_train_projector_and_classifier(self): self._set_trainable(projector=True, classifier=True)
     def set_finetuning_all(self): self._set_trainable(projector=True, classifier=True, llama_lora=True)
     
-    # --- FIX: Mean pooling for sentence-transformers ---
-    def _mean_pooling(self, model_output, attention_mask):
-        token_embeddings = model_output[0] # First element of model_output contains all token embeddings
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-
-    def get_cls_embeddings(self, sequences_):
-        sequences = [s[:self.max_seq_len] for s in sequences_]
-        merged_logs, start_positions = merge_data(sequences)
-        if not merged_logs: return None, None
-
-        all_bert_outputs = []
-        physical_batch_size = 128
-        with torch.no_grad():
-            for i in range(0, len(merged_logs), physical_batch_size):
-                batch_logs = merged_logs[i:i+physical_batch_size]
-                inputs = self.bert_tokenizer(batch_logs, return_tensors="pt", max_length=self.max_content_len, padding=True, truncation=True).to(self.bert_model.device)
-                
-                model_output = self.bert_model(**inputs)
-
-                # Use mean pooling for sentence-transformers, CLS token for others
-                if 'sentence-transformer' in self.bert_model.config._name_or_path:
-                    sentence_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
-                else:
-                    sentence_embeddings = model_output.last_hidden_state[:, 0, :]
-                
-                all_bert_outputs.append(sentence_embeddings.cpu())
-        
-        if not all_bert_outputs: return None, None
-        bert_outputs = torch.cat(all_bert_outputs, dim=0).to(self.device)
+    def get_logits(self, precomputed_embeddings):
+        if not precomputed_embeddings: return None, None
 
         projector_dtype = next(self.projector.parameters()).dtype
-        projected_outputs = self.projector(bert_outputs.to(projector_dtype)).to(self.llama_model.dtype)
-        if projected_outputs.shape[0] == 0: return [], self.llama_model.device
-        split_indices = start_positions[1:]
-        if not split_indices: return [projected_outputs], self.llama_model.device
-        return list(torch.tensor_split(projected_outputs, split_indices, dim=0)), self.llama_model.device
-
-    def _get_logits(self, sequences_):
-        seq_embeddings, embed_device = self.get_cls_embeddings(sequences_)
-        if seq_embeddings is None: return None, None
+        projected_embeddings = [self.projector(emb.to(self.device).to(projector_dtype)) for emb in precomputed_embeddings]
+        
+        seq_embeddings = [emb.to(self.llama_model.dtype) for emb in projected_embeddings]
+        
         embed_layer = self.llama_model.get_input_embeddings(); instruc_embeds = embed_layer(self.instruc_tokens['input_ids'])
         valid_embeddings, original_indices = [], []
         for i, seq_embed in enumerate(seq_embeddings):
             if seq_embed is not None and seq_embed.shape[0] > 0:
                 full_embed = torch.cat([instruc_embeds[0], seq_embed], dim=0); valid_embeddings.append(full_embed); original_indices.append(i)
+        
         if not valid_embeddings: return None, None
+        
         inputs_embeds, attention_mask = stack_and_pad_left(valid_embeddings)
         outputs = self.llama_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
+        
         if hasattr(outputs, 'last_hidden_state'): last_hidden_state = outputs.last_hidden_state
         elif hasattr(outputs, 'hidden_states'): last_hidden_state = outputs.hidden_states[-1]
         else: raise AttributeError("Model output does not contain 'last_hidden_state' or 'hidden_states'.")
+        
         sequence_lengths = attention_mask.sum(dim=1) - 1; batch_indices = torch.arange(len(valid_embeddings), device=last_hidden_state.device)
         cls_input_hidden_state = last_hidden_state[batch_indices, sequence_lengths]
         classifier_dtype = next(self.classifier.parameters()).dtype; logits = self.classifier(cls_input_hidden_state.to(classifier_dtype))
         return logits, original_indices
 
-    def forward(self, sequences_):
-        self.eval()
-        with torch.inference_mode():
-            logits, original_indices = self._get_logits(sequences_)
-            if logits is None:
-                return torch.full((len(sequences_), 2), -float('inf'), device=self.device)
-            full_batch_logits = torch.full((len(sequences_), 2), -float('inf'), device=logits.device, dtype=logits.dtype)
-            full_batch_logits[original_indices] = logits
-            return full_batch_logits
-
-    def train_helper(self, sequences_, labels):
+    def train_helper(self, labels, precomputed_embeddings):
         self.train()
-        logits, original_indices = self._get_logits(sequences_)
+        logits, original_indices = self.get_logits(precomputed_embeddings=precomputed_embeddings)
         if logits is None: return torch.tensor([]), torch.tensor([])
         valid_str_labels = [labels[i] for i in original_indices]
         integer_labels = torch.tensor([1 if lbl == 'anomalous' else 0 for lbl in valid_str_labels], dtype=torch.long, device=logits.device)
