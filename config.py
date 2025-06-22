@@ -29,16 +29,15 @@ REPORTS_DIR.mkdir(exist_ok=True)
 EMBEDDING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- FINAL, OPTIMIZED HYPERPARAMETERS FOR SOTA RUN ---
-# This configuration is validated by the successful test run and is designed
-# to achieve maximum performance on the full dataset.
+# --- HYPERPARAMETERS TUNED FOR PEAK PERFORMANCE (r=64) ---
 DEFAULT_HYPERPARAMETERS = {
     # Phase 1: Train the input/output adapters (Projector + Classifier)
     "n_epochs_phase_adapters": 5,
     "lr_phase_adapters": 5e-5,
     
     # Phase 2: Fine-tune the entire pipeline (LoRA + Projector + Classifier)
-    "n_epochs_phase_full": 12,
+    # --- FIX: Increased epoch budget to allow the more powerful r=64 model to fully converge ---
+    "n_epochs_phase_full": 15,
     "lr_phase_full": 2e-5,
     
     "batch_size": 8,

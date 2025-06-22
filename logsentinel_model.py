@@ -2,10 +2,13 @@ import torch
 import os
 from torch import nn
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoModelForCausalLM
 from utils.model_loader import load_model_and_tokenizer
 from utils.helpers import stack_and_pad_left
 import traceback
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, message=".*You passed `quantization_config`.*")
 
 class LogSentinelModel(nn.Module):
     def __init__(self, llama_path, encoder_hidden_size, ft_path=None, is_train_mode=True, device=None):
@@ -52,8 +55,13 @@ class LogSentinelModel(nn.Module):
             elif is_train_mode:
                 self._log("No adapter found. Creating new PEFT configuration for training.")
                 if getattr(self.llama_model, "is_loaded_in_8bit", False) or getattr(self.llama_model, "is_loaded_in_4bit", False):
-                    self.llama_model = prepare_model_for_kbit_training(self.llama_model, use_gradient_checkpointing=True)
-                lora_config = LoraConfig(r=32, lora_alpha=64, lora_dropout=0.1, target_modules=["q_proj", "v_proj"], bias="none", task_type=TaskType.CAUSAL_LM)
+                    # --- DEFINITIVE FIX: Disable gradient checkpointing to accelerate training time ---
+                    # This increases VRAM usage during training but makes the forward pass much faster.
+                    # It has NO impact on inference speed or memory.
+                    self.llama_model = prepare_model_for_kbit_training(self.llama_model, use_gradient_checkpointing=False)
+                    self._log("Gradient checkpointing disabled for faster training.")
+
+                lora_config = LoraConfig(r=64, lora_alpha=64, lora_dropout=0.1, target_modules=["q_proj", "v_proj"], bias="none", task_type=TaskType.CAUSAL_LM)
                 self.llama_model = get_peft_model(self.llama_model, lora_config)
                 self.llama_model.print_trainable_parameters()
             else:
@@ -80,9 +88,8 @@ class LogSentinelModel(nn.Module):
             elif 'classifier' in name and kwargs.get('classifier'): param.requires_grad = True
             elif 'llama_model' in name and 'lora_' in name and kwargs.get('llama_lora'): param.requires_grad = True
 
-    # --- FIX: Remove unused functions from old 4-phase model ---
     def set_train_projector_and_classifier(self): self._set_trainable(projector=True, classifier=True)
-    def set_finetuning_all(self): self._set_trainable(projector=True, classifier=True, llama_lora=True)
+    def set_finetuning_all(self): self._set_trainable(projector=True, classifier=True, lora_lora=True)
     
     def get_logits(self, precomputed_embeddings):
         if not precomputed_embeddings: return None, None
