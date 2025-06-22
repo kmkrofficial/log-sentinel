@@ -13,6 +13,14 @@ import tempfile
 import shutil
 import pandas as pd
 import traceback
+import warnings
+from sklearn.exceptions import UndefinedMetricWarning
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.cuda.amp.grad_scaler")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo.eval_frame")
+warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes.autograd._functions")
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning, module="sklearn.metrics._classification")
+
 
 from config import REPORTS_DIR, DEFAULT_BERT_PATH, TEMP_MODELS_DIR
 from utils.database_manager import DatabaseManager
@@ -98,8 +106,11 @@ class TrainingController:
 
         df = pd.read_csv(dataset_path)
         if self.is_test_run:
+            # --- DEFINITIVE FIX: Shuffle the dataframe before taking a sample ---
+            # This ensures the subset is representative and contains a mix of classes.
+            df = df.sample(frac=1, random_state=42).reset_index(drop=True)
             subset_size = int(self.test_run_percentage * len(df))
-            self._log(f"QUICK TEST RUN: Using first {subset_size} of {len(df)} rows for '{dataset_type}.csv'.")
+            self._log(f"QUICK TEST RUN: Using random {subset_size} rows ({self.test_run_percentage*100:.0f}%) for '{dataset_type}.csv'.")
             df = df.head(subset_size)
         
         full_dataset = LogDataset(dataframe=df)
@@ -346,50 +357,61 @@ class TrainingController:
             oversampled_less_count = int(num_majority * self.hp.get('min_less_portion', 0.5))
             effective_epoch_size = num_majority + max(num_less, oversampled_less_count)
             micro_batches_per_epoch = math.ceil(effective_epoch_size / self.hp['micro_batch_size'])
-            self.total_training_steps = sum([self.hp.get(f'n_epochs_phase{i+1}', 0) * micro_batches_per_epoch for i in range(4)])
+            
+            self.total_training_steps = sum([
+                self.hp.get('n_epochs_phase_adapters', 0) * micro_batches_per_epoch,
+                self.hp.get('n_epochs_phase_full', 0) * micro_batches_per_epoch
+            ])
             self._log(f"Max total training micro-batch steps calculated: {self.total_training_steps}")
             
             ft_path = None
-            training_phases = [
-                ("Projector", 'set_train_only_projector', self.hp['n_epochs_phase1'], self.hp['lr_phase1']),
-                ("Classifier", 'set_train_only_classifier', self.hp['n_epochs_phase2'], self.hp['lr_phase2']),
-                ("Projector+Classifier", 'set_train_projector_and_classifier', self.hp['n_epochs_phase3'], self.hp['lr_phase3']),
-                ("Fine-tuning All", 'set_finetuning_all', self.hp['n_epochs_phase4'], self.hp['lr_phase4'])
-            ]
-            all_phases_completed = True
-            for name, setup_func_name, epochs, lr in training_phases:
-                self._log(f"\n>>>> CONFIGURING MODEL FOR PHASE: {name} <<<<")
-                self.model = LogSentinelModel(self.model_name, encoder_hidden_size, ft_path, True, self.device)
-                getattr(self.model, setup_func_name)()
-                
-                if not self._train_phase(name, epochs, lr, train_dataset, validation_dataset):
-                    all_phases_completed = False; final_status = 'ABORTED'; break
-                
-                ft_path = self.report_dir / f"phase_{name}_model"
+            
+            phase1_name = "Adapters"
+            phase1_epochs = self.hp.get('n_epochs_phase_adapters', 0)
+            phase1_lr = self.hp.get('lr_phase_adapters', 5e-5)
+            self._log(f"\n>>>> CONFIGURING MODEL FOR PHASE: {phase1_name} <<<<")
+            self.model = LogSentinelModel(self.model_name, encoder_hidden_size, ft_path, True, self.device)
+            self.model.set_train_projector_and_classifier()
+            
+            if self._train_phase(phase1_name, phase1_epochs, phase1_lr, train_dataset, validation_dataset):
+                ft_path = self.report_dir / f"phase_{phase1_name}_model"
                 self._cleanup(self.model)
 
-            if all_phases_completed:
-                self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
-                self.model = LogSentinelModel(self.model_name, encoder_hidden_size, ft_path, False, self.device)
-                
-                final_metrics = {}
-                validation_metrics = self._evaluate_and_visualize(validation_dataset, "validation")
-                test_metrics = self._evaluate_and_visualize(test_dataset, "test")
-                final_metrics.update(validation_metrics)
-                final_metrics.update(test_metrics)
-                
-                final_metrics['overall'] = { "total_run_time_sec": time.time() - self.run_start_time }
-                
-                self.visualizer.plot_training_loss(self.batch_losses)
-                self.db.save_performance_metrics(self.run_id, final_metrics)
+                phase2_name = "Full_Fine_Tuning"
+                phase2_epochs = self.hp.get('n_epochs_phase_full', 0)
+                phase2_lr = self.hp.get('lr_phase_full', 2e-5)
+                self._log(f"\n>>>> CONFIGURING MODEL FOR PHASE: {phase2_name} <<<<")
+                self.model = LogSentinelModel(self.model_name, encoder_hidden_size, ft_path, True, self.device)
+                self.model.set_finetuning_all()
+                self._train_phase(phase2_name, phase2_epochs, phase2_lr, train_dataset, validation_dataset)
 
-                if ft_path and os.path.exists(ft_path):
-                    final_model_path = self.report_dir / 'final_model'
-                    if final_model_path.exists(): shutil.rmtree(final_model_path)
-                    shutil.copytree(ft_path, final_model_path)
-                    self._log(f"Consolidated best model saved to: {final_model_path}")
-                
-                final_status = 'COMPLETED'
+                ft_path = self.report_dir / f"phase_{phase2_name}_model"
+                self._cleanup(self.model)
+            else:
+                raise InterruptedError("Training was aborted during the Adapters phase.")
+
+
+            self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
+            self.model = LogSentinelModel(self.model_name, encoder_hidden_size, ft_path, False, self.device)
+            
+            final_metrics = {}
+            validation_metrics = self._evaluate_and_visualize(validation_dataset, "validation")
+            test_metrics = self._evaluate_and_visualize(test_dataset, "test")
+            final_metrics.update(validation_metrics)
+            final_metrics.update(test_metrics)
+            
+            final_metrics['overall'] = { "total_run_time_sec": time.time() - self.run_start_time }
+            
+            self.visualizer.plot_training_loss(self.batch_losses)
+            self.db.save_performance_metrics(self.run_id, final_metrics)
+
+            if ft_path and os.path.exists(ft_path):
+                final_model_path = self.report_dir / 'final_model'
+                if final_model_path.exists(): shutil.rmtree(final_model_path)
+                shutil.copytree(ft_path, final_model_path)
+                self._log(f"Consolidated best model saved to: {final_model_path}")
+            
+            final_status = 'COMPLETED'
         except Exception as e:
             tb_str = traceback.format_exc()
             error_msg = f"CRITICAL ERROR in run {self.run_id}: {e}\n{tb_str}"
@@ -410,5 +432,5 @@ class TrainingController:
                     if f_path.exists():
                         try: os.remove(f_path); self._log(f"  - Deleted: {f_path}")
                         except OSError as e: self._log(f"  - Error deleting {f_path}: {e}")
-                
+            
             self.callback({"status": final_status, "done": True})

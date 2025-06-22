@@ -3,7 +3,7 @@ from pathlib import Path
 # Project Root Directory
 ROOT_DIR = Path(__file__).resolve().parent
 
-# --- NEW: Centralized directory for all generated data ---
+# Centralized directory for all generated data
 DATA_CACHE_DIR = ROOT_DIR / 'logsentinel_data'
 
 # Core Directories
@@ -12,7 +12,7 @@ MODELS_DIR = ROOT_DIR / 'models'
 REPORTS_DIR = ROOT_DIR / 'reports'
 UTILS_DIR = ROOT_DIR / 'utils'
 
-# --- NEW: Specific paths for generated data ---
+# Specific paths for generated data
 EMBEDDING_CACHE_DIR = DATA_CACHE_DIR / 'embedding_cache'
 TEMP_MODELS_DIR = DATA_CACHE_DIR / 'temp_models'
 
@@ -29,18 +29,18 @@ REPORTS_DIR.mkdir(exist_ok=True)
 EMBEDDING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- FINAL, OPTIMIZED HYPERPARAMETERS ---
-# Based on analysis of successful runs with Early Stopping.
-# These values provide a fast and effective training cycle, prioritizing generalization.
+# --- FINAL, OPTIMIZED HYPERPARAMETERS FOR SOTA RUN ---
+# This configuration is validated by the successful test run and is designed
+# to achieve maximum performance on the full dataset.
 DEFAULT_HYPERPARAMETERS = {
-    "n_epochs_phase1": 2,
-    "n_epochs_phase2": 1,
-    "n_epochs_phase3": 3,
-    "n_epochs_phase4": 8,                  # A reasonable budget for the final phase
-    "lr_phase1": 8e-05,
-    "lr_phase2": 5e-05,
-    "lr_phase3": 3e-05,
-    "lr_phase4": 2e-05,
+    # Phase 1: Train the input/output adapters (Projector + Classifier)
+    "n_epochs_phase_adapters": 5,
+    "lr_phase_adapters": 5e-5,
+    
+    # Phase 2: Fine-tune the entire pipeline (LoRA + Projector + Classifier)
+    "n_epochs_phase_full": 12,
+    "lr_phase_full": 2e-5,
+    
     "batch_size": 8,
     "micro_batch_size": 4,
     "max_content_len": 100,
@@ -48,5 +48,5 @@ DEFAULT_HYPERPARAMETERS = {
     "min_less_portion": 0.5,
     "early_stopping_patience": 2,
     "early_stopping_metric": "f1_score",
-    "early_stopping_min_delta": 0.01       # Assertive delta to prevent overfitting
+    "early_stopping_min_delta": 0.01
 }

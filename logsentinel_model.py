@@ -5,7 +5,7 @@ from peft import PeftModel, LoraConfig, TaskType, get_peft_model, prepare_model_
 from transformers import AutoConfig
 from utils.model_loader import load_model_and_tokenizer
 from utils.helpers import stack_and_pad_left
-import traceback # Import traceback for detailed error logging
+import traceback
 
 class LogSentinelModel(nn.Module):
     def __init__(self, llama_path, encoder_hidden_size, ft_path=None, is_train_mode=True, device=None):
@@ -59,7 +59,6 @@ class LogSentinelModel(nn.Module):
             else:
                 self._log("Warning: Evaluation mode selected but no fine-tuned adapter path was provided. Using base model only.")
         except Exception as e:
-            # --- FIX: Add detailed traceback logging to model setup ---
             self._log(f"FATAL: An error occurred during PEFT setup in LogSentinelModel.")
             self._log(traceback.format_exc())
             raise e
@@ -81,8 +80,7 @@ class LogSentinelModel(nn.Module):
             elif 'classifier' in name and kwargs.get('classifier'): param.requires_grad = True
             elif 'llama_model' in name and 'lora_' in name and kwargs.get('llama_lora'): param.requires_grad = True
 
-    def set_train_only_projector(self): self._set_trainable(projector=True)
-    def set_train_only_classifier(self): self._set_trainable(classifier=True)
+    # --- FIX: Remove unused functions from old 4-phase model ---
     def set_train_projector_and_classifier(self): self._set_trainable(projector=True, classifier=True)
     def set_finetuning_all(self): self._set_trainable(projector=True, classifier=True, llama_lora=True)
     
