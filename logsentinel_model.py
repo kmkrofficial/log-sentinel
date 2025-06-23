@@ -55,9 +55,6 @@ class LogSentinelModel(nn.Module):
             elif is_train_mode:
                 self._log("No adapter found. Creating new PEFT configuration for training.")
                 if getattr(self.llama_model, "is_loaded_in_8bit", False) or getattr(self.llama_model, "is_loaded_in_4bit", False):
-                    # --- DEFINITIVE FIX: Disable gradient checkpointing to accelerate training time ---
-                    # This increases VRAM usage during training but makes the forward pass much faster.
-                    # It has NO impact on inference speed or memory.
                     self.llama_model = prepare_model_for_kbit_training(self.llama_model, use_gradient_checkpointing=False)
                     self._log("Gradient checkpointing disabled for faster training.")
 
@@ -95,28 +92,48 @@ class LogSentinelModel(nn.Module):
         if not precomputed_embeddings: return None, None
 
         projector_dtype = next(self.projector.parameters()).dtype
-        projected_embeddings = [self.projector(emb.to(self.device).to(projector_dtype)) for emb in precomputed_embeddings]
+        
+        # Filter for valid (non-empty) sequences and store their original indices and lengths
+        valid_embs_to_project, original_indices, seq_lengths = [], [], []
+        for i, emb in enumerate(precomputed_embeddings):
+            if emb is not None and emb.shape[0] > 0:
+                valid_embs_to_project.append(emb)
+                original_indices.append(i)
+                seq_lengths.append(emb.shape[0])
+
+        if not valid_embs_to_project:
+            return None, None
+
+        # --- Batch Projection Optimization ---
+        # 1. Concatenate all sequences into a single tensor
+        mega_batch = torch.cat(valid_embs_to_project, dim=0).to(self.device).to(projector_dtype)
+        # 2. Project the entire mega-batch in one efficient operation
+        projected_mega_batch = self.projector(mega_batch)
+        # 3. Split the result back into a list of tensors
+        projected_embeddings = list(torch.split(projected_mega_batch, seq_lengths))
         
         seq_embeddings = [emb.to(self.llama_model.dtype) for emb in projected_embeddings]
         
-        embed_layer = self.llama_model.get_input_embeddings(); instruc_embeds = embed_layer(self.instruc_tokens['input_ids'])
-        valid_embeddings, original_indices = [], []
-        for i, seq_embed in enumerate(seq_embeddings):
-            if seq_embed is not None and seq_embed.shape[0] > 0:
-                full_embed = torch.cat([instruc_embeds[0], seq_embed], dim=0); valid_embeddings.append(full_embed); original_indices.append(i)
+        embed_layer = self.llama_model.get_input_embeddings()
+        instruc_embeds = embed_layer(self.instruc_tokens['input_ids'])
         
-        if not valid_embeddings: return None, None
+        # Combine instruction and projected embeddings
+        full_embeddings = [torch.cat([instruc_embeds[0], seq_embed], dim=0) for seq_embed in seq_embeddings]
         
-        inputs_embeds, attention_mask = stack_and_pad_left(valid_embeddings)
+        inputs_embeds, attention_mask = stack_and_pad_left(full_embeddings)
         outputs = self.llama_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
         
         if hasattr(outputs, 'last_hidden_state'): last_hidden_state = outputs.last_hidden_state
         elif hasattr(outputs, 'hidden_states'): last_hidden_state = outputs.hidden_states[-1]
         else: raise AttributeError("Model output does not contain 'last_hidden_state' or 'hidden_states'.")
         
-        sequence_lengths = attention_mask.sum(dim=1) - 1; batch_indices = torch.arange(len(valid_embeddings), device=last_hidden_state.device)
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_indices = torch.arange(len(full_embeddings), device=last_hidden_state.device)
         cls_input_hidden_state = last_hidden_state[batch_indices, sequence_lengths]
-        classifier_dtype = next(self.classifier.parameters()).dtype; logits = self.classifier(cls_input_hidden_state.to(classifier_dtype))
+        
+        classifier_dtype = next(self.classifier.parameters()).dtype
+        logits = self.classifier(cls_input_hidden_state.to(classifier_dtype))
+        
         return logits, original_indices
 
     def train_helper(self, labels, precomputed_embeddings):

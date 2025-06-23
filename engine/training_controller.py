@@ -21,6 +21,10 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo.ev
 warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes.autograd._functions")
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning, module="sklearn.metrics._classification")
 
+# --- TF32 Optimization ---
+# Enable hardware-accelerated matrix multiplication on Ampere GPUs and newer
+torch.backends.cuda.matmul.allow_tf32 = True
+
 
 from config import REPORTS_DIR, DEFAULT_BERT_PATH, TEMP_MODELS_DIR
 from utils.database_manager import DatabaseManager
@@ -106,8 +110,6 @@ class TrainingController:
 
         df = pd.read_csv(dataset_path)
         if self.is_test_run:
-            # --- DEFINITIVE FIX: Shuffle the dataframe before taking a sample ---
-            # This ensures the subset is representative and contains a mix of classes.
             df = df.sample(frac=1, random_state=42).reset_index(drop=True)
             subset_size = int(self.test_run_percentage * len(df))
             self._log(f"QUICK TEST RUN: Using random {subset_size} rows ({self.test_run_percentage*100:.0f}%) for '{dataset_type}.csv'.")
