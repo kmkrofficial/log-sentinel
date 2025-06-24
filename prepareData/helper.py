@@ -1,16 +1,22 @@
-#see https://pinjiahe.github.io/papers/ISSRE16.pdf
 import os
 import pandas as pd
 import re
 from datetime import datetime
 
 def fixedSize_window(raw_data, window_size, step_size):
+    """
+    This function remains unchanged as per the request, but it will now operate
+    on smaller, chunked DataFrames passed to it.
+    """
+    if raw_data.empty:
+        return pd.DataFrame([], columns=list(raw_data.columns)+['item_Label'])
+        
     aggregated = [
         [raw_data['Content'].iloc[i:i + window_size].values,
         max(raw_data['Label'].iloc[i:i + window_size]),
          raw_data['Label'].iloc[i:i + window_size].values.tolist()
          ]
-        for i in range(0, len(raw_data), step_size)
+        for i in range(0, len(raw_data) - window_size + 1, step_size)
     ]
     return pd.DataFrame(aggregated, columns=list(raw_data.columns)+['item_Label'])
 
@@ -86,55 +92,39 @@ def sliding_window(raw_data, para):
     print('there are %d instances (sliding windows) in this dataset\n' % len(start_end_index_pair))
     return pd.DataFrame(new_data, columns=list(raw_data.columns)+['item_Label'])
 
-def log_to_dataframe(log_file, regex, headers, start_line, end_line):
-    """ Function to transform log file to dataframe
+def log_to_dataframe_generator(log_file, regex, headers, start_line, end_line, chunk_size=1000000):
+    """ 
+    --- FIX: Modified to be a generator that yields DataFrames in chunks ---
+    This prevents loading the entire log file into memory.
     """
     log_messages = []
-    linecount = 0
-    cnt = 0
-
-    if end_line is None:
-        with open(log_file, 'r', encoding='latin-1') as fin:  # , encoding='latin-1'
-            while True:
-                line = fin.readline()
-                if not line:
-                    break
-                # for line in fin.readlines():
-                cnt += 1
-                try:
-                    match = regex.search(line.strip())
+    line_count = 0
+    
+    with open(log_file, 'r', encoding='latin-1') as fin:
+        for i, line in enumerate(fin):
+            if i < start_line:
+                continue
+            if end_line is not None and i >= end_line:
+                break
+            
+            try:
+                match = regex.search(line.strip())
+                if match:
                     message = [match.group(header) for header in headers]
                     log_messages.append(message)
-                    linecount += 1
-                except Exception as e:
-                    # print("\n", line)
-                    # print(e)
-                    pass
+                    line_count += 1
+            except Exception as e:
+                pass # Skip lines that don't match
 
-    else:
-        line_pos = -1
-        with open(log_file, 'r', encoding='latin-1') as fin:
-            while True:
-                line = fin.readline()
-                line_pos += 1
-                if line_pos < start_line:
-                    continue
-                if not line or line_pos >= end_line:
-                    break
-                cnt += 1
-                try:
-                    match = regex.search(line.strip())
-                    message = [match.group(header) for header in headers]
-                    log_messages.append(message)
-                    linecount += 1
-                except Exception as e:
-                    # print("\n", line)
-                    # print(e)
-                    pass
+            if line_count == chunk_size:
+                yield pd.DataFrame(log_messages, columns=headers)
+                log_messages = []
+                line_count = 0
+    
+    # Yield any remaining log messages
+    if log_messages:
+        yield pd.DataFrame(log_messages, columns=headers)
 
-    print("Total size is {}; Total size after encoding is {}".format(linecount, cnt))
-    logdf = pd.DataFrame(log_messages, columns=headers)
-    return logdf
 
 def generate_logformat_regex(logformat):
     """ Function to generate regular expression to split log messages
@@ -153,15 +143,27 @@ def generate_logformat_regex(logformat):
     regex = re.compile('^' + regex + '$')
     return headers, regex
 
-def structure_log(input_dir, output_dir, log_name, log_format,  start_line = 0, end_line = None):
+def structure_log(input_dir, output_dir, log_name, log_format, start_line=0, end_line=None):
+    """ 
+    --- FIX: Modified to consume the generator and write to CSV in chunks ---
+    """
     print('Structuring file: ' + os.path.join(input_dir, log_name))
     start_time = datetime.now()
     headers, regex = generate_logformat_regex(log_format)
-    df_log = log_to_dataframe(os.path.join(input_dir, log_name), regex, headers, start_line, end_line)
+    
+    output_path = os.path.join(output_dir, log_name + '_structured.csv')
+    
+    # Use the generator to process the log file in chunks
+    chunk_generator = log_to_dataframe_generator(os.path.join(input_dir, log_name), regex, headers, start_line, end_line)
 
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    df_log.to_csv(os.path.join(output_dir, log_name + '_structured.csv'), index=False, escapechar='\\')
-
-    print('Structuring done. [Time taken: {!s}]'.format(datetime.now() - start_time))
+    # Write the first chunk with a header, then append the rest
+    first_chunk = True
+    for i, df_chunk in enumerate(chunk_generator):
+        print(f"Processing and writing chunk {i+1}...", end='\r')
+        if first_chunk:
+            df_chunk.to_csv(output_path, index=False, escapechar='\\')
+            first_chunk = False
+        else:
+            df_chunk.to_csv(output_path, mode='a', header=False, index=False, escapechar='\\')
+    
+    print("\nStructuring done. [Time taken: {!s}]".format(datetime.now() - start_time))

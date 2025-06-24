@@ -212,5 +212,6 @@ pyrightconfig.json
 /datasets
 *.rar
 *.whl
+/logsentinel_data
 
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks,visualstudiocode
