@@ -1,72 +1,149 @@
 import streamlit as st
-from pathlib import Path
-import shutil
+import pandas as pd
+import threading
+import time
 import os
-from config import DB_PATH, REPORTS_DIR, DATA_CACHE_DIR # Import new central data dir
+import json
+from pathlib import Path
 
-# --- Main App Content ---
-st.title("🛡️ LogSentinel: Edge-Optimized Anomaly Detection")
+from utils.database_manager import DatabaseManager
+from utils.global_state import GLOBAL_APP_STATE, APP_LOCK
+from engine.training_controller import TrainingController
+from config import DEFAULT_HYPERPARAMETERS, DATA_DIR, DB_PATH, MODELS_DIR
+from utils.model_loader import get_local_models
+from utils.ui_helpers import reset_global_state, callback_handler, render_run_status
+
+st.set_page_config(page_title="Train & Evaluate", page_icon="🏋️", layout="wide")
+
+def get_available_datasets():
+    if not DATA_DIR.is_dir(): return []
+    dataset_dirs = [d for d in DATA_DIR.iterdir() if d.is_dir()]
+    valid_datasets = []
+    for d in dataset_dirs:
+        if (d / 'train.csv').exists() and (d / 'test.csv').exists():
+            valid_datasets.append(d.name)
+    return valid_datasets
+
+def run_training_in_thread(model_name, dataset_name, hyperparameters, use_cache, is_test_run, test_run_percentage):
+    db_manager = None
+    try:
+        db_manager = DatabaseManager(db_path=DB_PATH)
+        controller = TrainingController(
+            model_name=model_name,
+            dataset_name=dataset_name,
+            hyperparameters=hyperparameters,
+            db_manager=db_manager,
+            callback=callback_handler,
+            use_cached_embeddings=use_cache,
+            is_test_run=is_test_run,
+            test_run_percentage=test_run_percentage
+        )
+        controller.run()
+    except Exception as e:
+        print(f"Error during training thread: {e}")
+        GLOBAL_APP_STATE["error"] = str(e)
+    finally:
+        with APP_LOCK:
+            GLOBAL_APP_STATE["is_task_running"] = False
+        if db_manager:
+            db_manager.close()
+        GLOBAL_APP_STATE["done"] = True
+
+st.title("🏋️ Train & Evaluate a New Model")
 st.markdown("---")
 
-st.header("Welcome to LogSentinel")
+is_any_task_running = GLOBAL_APP_STATE.get("is_task_running")
+if is_any_task_running:
+    st.warning(f"A '{GLOBAL_APP_STATE.get('task_type')}' task is currently running. All controls are disabled.")
 
-st.write("""
-This application provides a complete toolkit for training, evaluating, and deploying
-log anomaly detection models based on the LogLLM architecture, optimized for
-resource-constrained environments.
+rerun_config = st.session_state.pop('rerun_config', None)
+col1, col2 = st.columns(2)
 
-**Navigate using the sidebar to:**
-- **Train & Evaluate:** Launch a new training run with custom models and datasets.
-- **View History:** Review detailed reports and metrics from past training runs.
-- **Inference:** Perform real-time anomaly detection on log sequences.
-""")
+with col1:
+    st.header("Training Configuration")
 
-# --- Instructions for setup ---
-st.info("""
-**Getting Started:**
-1.  Ensure you have placed your datasets in the `datasets/` directory. Each dataset should have its own folder (e.g., `datasets/BGL/`) containing `train.csv`, `validation.csv`, and `test.csv`.
-2.  Pre-downloaded models can be placed in the `models/` directory.
-3.  Use the `run_training.py` script for command-line training or use the **Train & Evaluate** page to start a run from the UI.
-""")
+    st.subheader("1. Model Selection")
+    model_source = st.radio("Select Model Source", ["Hugging Face", "Local"], horizontal=True, index=0, disabled=is_any_task_running)
+    
+    model_name_input = None
+    if model_source == "Hugging Face":
+        st.info("""**Note:** To use gated models, you must first authenticate from your terminal: `huggingface-cli login`""")
+        model_name_input = st.text_input("Enter Hugging Face Model ID", value="meta-llama/Llama-3.2-1B", disabled=is_any_task_running)
+    else:
+        local_models = get_local_models()
+        if not local_models:
+            st.warning("No local models found in `models/`.")
+        else:
+            model_name_input = st.selectbox("Select a Local Model", options=local_models, disabled=is_any_task_running)
 
+    st.subheader("2. Dataset Selection")
+    available_datasets = get_available_datasets()
+    if not available_datasets: st.error("No valid datasets found in `datasets/` (must contain `train.csv` and `test.csv`)."); st.stop()
+    dataset_name_select = st.selectbox("Select Dataset", options=available_datasets, disabled=is_any_task_running)
 
-# --- Danger Zone for Application Reset ---
-st.markdown("---")
-with st.expander("⚠️ Danger Zone: Application Reset"):
-    st.warning(
-        "**This is a destructive action and cannot be undone.**\n\n"
-        "Clicking this button will permanently delete:\n"
-        "- All run history from the database (`logsentinel.db`).\n"
-        "- All generated reports and plots from the `reports/` directory.\n"
-        "- The entire `logsentinel_data/` directory, including all cached embeddings and temporary models."
-    )
+    st.subheader("3. Caching and Hyperparameters")
+    use_cache_checkbox = st.checkbox("Use Cached Embeddings (if available)", value=True, help="Speeds up repeated runs. Uncheck to force re-generation of embeddings.", disabled=is_any_task_running)
+    
+    initial_hp = rerun_config['hyperparameters'] if rerun_config else DEFAULT_HYPERPARAMETERS
+    hp_json_input = st.text_area("Edit Hyperparameters (JSON format)", value=json.dumps(initial_hp, indent=4), height=300, disabled=is_any_task_running)
+    
+    try:
+        json.loads(hp_json_input)
+        st.success("JSON is valid.")
+    except json.JSONDecodeError as e:
+        st.error(f"Invalid JSON: {e}")
 
-    if st.button("Factory Reset Application", type="primary", use_container_width=True):
-        try:
-            # Delete database file
-            if DB_PATH.exists():
-                os.remove(DB_PATH)
-                st.toast(f"Deleted database: {DB_PATH}", icon="🗑️")
+    st.subheader("4. Launch Run")
+    
+    with st.container(border=True):
+        is_test_run_checkbox = st.checkbox(
+            "🧪 Quick Test Run",
+            value=False,
+            help="Uses a small subset of the data to quickly verify the pipeline. Caches are still used if available.",
+            disabled=is_any_task_running
+        )
 
-            # Delete reports directory
-            if REPORTS_DIR.exists() and REPORTS_DIR.is_dir():
-                shutil.rmtree(REPORTS_DIR)
-                st.toast(f"Deleted reports directory: {REPORTS_DIR}", icon="🗑️")
+        test_run_percentage = 30
+        if is_test_run_checkbox:
+            test_run_percentage = st.slider(
+                "Percentage of data to use for test run:",
+                min_value=1,
+                max_value=100,
+                value=20,
+                step=1,
+                format="%d%%",
+                disabled=is_any_task_running
+            )
 
-            # --- FIX: Delete the entire centralized data directory ---
-            if DATA_CACHE_DIR.exists() and DATA_CACHE_DIR.is_dir():
-                shutil.rmtree(DATA_CACHE_DIR)
-                st.toast(f"Deleted data directory: {DATA_CACHE_DIR}", icon="🗑️")
-            
-            # Re-create directories for future runs
-            REPORTS_DIR.mkdir(exist_ok=True)
-            DATA_CACHE_DIR.mkdir(exist_ok=True)
-            (DATA_CACHE_DIR / 'embedding_cache').mkdir(exist_ok=True)
-            (DATA_CACHE_DIR / 'temp_models').mkdir(exist_ok=True)
-            
-            st.success("✅ Application has been successfully reset!")
-            st.info("Please refresh the page to see the changes.")
-            
-        except Exception as e:
-            st.error(f"An error occurred during reset: {e}")
-            print(f"CRITICAL ERROR during Factory Reset: {e}")
+    st.markdown("---")
+    
+    if st.button("🚀 Launch Training Run", type="primary", use_container_width=True, disabled=is_any_task_running):
+        if not model_name_input: st.error("Model name cannot be empty.")
+        else:
+            try:
+                hyperparams_for_run = json.loads(hp_json_input)
+                reset_global_state()
+                with APP_LOCK:
+                    GLOBAL_APP_STATE["is_task_running"] = True
+                    GLOBAL_APP_STATE["task_type"] = "Training"
+                
+                thread = threading.Thread(
+                    target=run_training_in_thread,
+                    args=(
+                        model_name_input,
+                        dataset_name_select,
+                        hyperparams_for_run,
+                        use_cache_checkbox,
+                        is_test_run_checkbox,
+                        test_run_percentage / 100.0
+                    )
+                )
+                thread.start()
+                st.rerun()
+            except json.JSONDecodeError as e:
+                st.error(f"Invalid JSON in hyperparameters: {e}")
+
+with col2:
+    st.header("Live Run Status")
+    render_run_status("Training")
+

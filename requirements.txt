@@ -1,5 +1,4 @@
 streamlit
-torch
 transformers
 peft
 bitsandbytes
@@ -15,3 +14,4 @@ tqdm
 fpdf2
 onnx
 onnxruntime
+sentence-transformers

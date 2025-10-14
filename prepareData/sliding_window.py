@@ -4,8 +4,8 @@ import numpy as np
 from helper import fixedSize_window, structure_log
 
 # --- Script Configuration ---
-data_dir = r'E:\research-stuff\LogSentinel-3b\datasets\Thunderbird'
-log_name = "Thunderbird.log"
+data_dir = r'/media/koganrath/primary_drive/log-sentinel/datasets/BGL'
+log_name = "BGL.log"
 output_dir = data_dir
 
 start_line = 0

@@ -2,18 +2,18 @@ import torch
 import os
 from torch import nn
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 from utils.model_loader import load_model_and_tokenizer
-from utils.helpers import stack_and_pad_left
 import traceback
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, message=".*You passed `quantization_config`.*")
 
 class LogSentinelModel(nn.Module):
-    def __init__(self, llama_path, encoder_hidden_size, ft_path=None, is_train_mode=True, device=None):
+    def __init__(self, llama_path, encoder_hidden_size, hyperparameters, ft_path=None, is_train_mode=True, device=None):
         super().__init__()
         self.device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.hp = hyperparameters
 
         self.llama_model, self.llama_tokenizer = load_model_and_tokenizer(llama_path, is_train_mode)
 
@@ -27,7 +27,12 @@ class LogSentinelModel(nn.Module):
             nn.Linear(llama_hidden_size, llama_hidden_size)
         ).to(projector_device).to(compute_dtype)
 
-        self.classifier = nn.Linear(llama_hidden_size, 2).to(projector_device).to(compute_dtype)
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(llama_hidden_size, 256),
+            nn.GELU(),
+            nn.Linear(256, 2)
+        ).to(projector_device).to(compute_dtype)
 
         self.instruc_tokens = self.llama_tokenizer(
             ['Below is a sequence of system log messages:'],
@@ -41,31 +46,17 @@ class LogSentinelModel(nn.Module):
             if ft_path and os.path.exists(os.path.join(ft_path, 'Llama_ft', 'adapter_config.json')):
                 self._log(f"Found existing adapter at {ft_path}. Loading...")
                 self.llama_model = PeftModel.from_pretrained(self.llama_model, os.path.join(ft_path, 'Llama_ft'), is_trainable=is_train_mode)
-                self._log("PEFT adapter loaded successfully.")
-                
-                projector_path = os.path.join(ft_path, 'projector.pt')
-                classifier_path = os.path.join(ft_path, 'classifier.pt')
-                if os.path.exists(projector_path):
-                    self.projector.load_state_dict(torch.load(projector_path, map_location=self.device))
-                    self._log("Projector weights loaded.")
-                if os.path.exists(classifier_path):
-                    self.classifier.load_state_dict(torch.load(classifier_path, map_location=self.device))
-                    self._log("Classifier weights loaded.")
-
             elif is_train_mode:
                 self._log("No adapter found. Creating new PEFT configuration for training.")
-                if getattr(self.llama_model, "is_loaded_in_8bit", False) or getattr(self.llama_model, "is_loaded_in_4bit", False):
-                    self.llama_model = prepare_model_for_kbit_training(self.llama_model, use_gradient_checkpointing=False)
-                    self._log("Gradient checkpointing disabled for faster training.")
-
-                lora_config = LoraConfig(r=64, lora_alpha=64, lora_dropout=0.1, target_modules=["q_proj", "v_proj"], bias="none", task_type=TaskType.CAUSAL_LM)
+                self.llama_model = prepare_model_for_kbit_training(self.llama_model, use_gradient_checkpointing=False)
+                
+                lora_rank = self.hp.get('lora_r', 64)
+                self._log(f"Using LoRA rank (r): {lora_rank}")
+                lora_config = LoraConfig(r=lora_rank, lora_alpha=lora_rank, lora_dropout=0.1, target_modules=["q_proj", "v_proj"], bias="none", task_type=TaskType.CAUSAL_LM)
                 self.llama_model = get_peft_model(self.llama_model, lora_config)
                 self.llama_model.print_trainable_parameters()
-            else:
-                self._log("Warning: Evaluation mode selected but no fine-tuned adapter path was provided. Using base model only.")
         except Exception as e:
-            self._log(f"FATAL: An error occurred during PEFT setup in LogSentinelModel.")
-            self._log(traceback.format_exc())
+            self._log(f"FATAL: An error occurred during PEFT setup: {e}\n{traceback.format_exc()}")
             raise e
 
     def _log(self, message):
@@ -76,70 +67,46 @@ class LogSentinelModel(nn.Module):
         self.llama_model.save_pretrained(os.path.join(path, 'Llama_ft'))
         torch.save(self.projector.state_dict(), os.path.join(path, 'projector.pt'))
         torch.save(self.classifier.state_dict(), os.path.join(path, 'classifier.pt'))
-        self._log(f"Fine-tuned adapter and components saved to {path}")
+        self._log(f"Fine-tuned components saved to {path}")
 
-    def _set_trainable(self, **kwargs):
+    def set_trainable(self, **kwargs):
         for name, param in self.named_parameters():
-            param.requires_grad = False
-            if 'projector' in name and kwargs.get('projector'): param.requires_grad = True
-            elif 'classifier' in name and kwargs.get('classifier'): param.requires_grad = True
-            elif 'llama_model' in name and 'lora_' in name and kwargs.get('llama_lora'): param.requires_grad = True
+            is_lora = 'lora_' in name
+            is_projector = 'projector' in name
+            is_classifier = 'classifier' in name
+            
+            if (is_lora and kwargs.get('llama_lora')) or \
+               (is_projector and kwargs.get('projector')) or \
+               (is_classifier and kwargs.get('classifier')):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
-    def set_train_projector_and_classifier(self): self._set_trainable(projector=True, classifier=True)
-    def set_finetuning_all(self): self._set_trainable(projector=True, classifier=True, lora_lora=True)
+    def set_train_projector_and_classifier(self): self.set_trainable(projector=True, classifier=True)
+    def set_finetuning_all(self): self.set_trainable(projector=True, classifier=True, llama_lora=True)
     
-    def get_logits(self, precomputed_embeddings):
-        if not precomputed_embeddings: return None, None
-
-        projector_dtype = next(self.projector.parameters()).dtype
+    def get_logits(self, sequence_tensor_batch):
+        batch_size = sequence_tensor_batch.shape[0]
         
-        # Filter for valid (non-empty) sequences and store their original indices and lengths
-        valid_embs_to_project, original_indices, seq_lengths = [], [], []
-        for i, emb in enumerate(precomputed_embeddings):
-            if emb is not None and emb.shape[0] > 0:
-                valid_embs_to_project.append(emb)
-                original_indices.append(i)
-                seq_lengths.append(emb.shape[0])
-
-        if not valid_embs_to_project:
-            return None, None
-
-        # --- Batch Projection Optimization ---
-        # 1. Concatenate all sequences into a single tensor
-        mega_batch = torch.cat(valid_embs_to_project, dim=0).to(self.device).to(projector_dtype)
-        # 2. Project the entire mega-batch in one efficient operation
-        projected_mega_batch = self.projector(mega_batch)
-        # 3. Split the result back into a list of tensors
-        projected_embeddings = list(torch.split(projected_mega_batch, seq_lengths))
-        
-        seq_embeddings = [emb.to(self.llama_model.dtype) for emb in projected_embeddings]
+        projected_batch = self.projector(sequence_tensor_batch)
         
         embed_layer = self.llama_model.get_input_embeddings()
-        instruc_embeds = embed_layer(self.instruc_tokens['input_ids'])
+        instruc_embeds = embed_layer(self.instruc_tokens['input_ids']).expand(batch_size, -1, -1)
         
-        # Combine instruction and projected embeddings
-        full_embeddings = [torch.cat([instruc_embeds[0], seq_embed], dim=0) for seq_embed in seq_embeddings]
+        inputs_embeds = torch.cat([instruc_embeds, projected_batch], dim=1)
         
-        inputs_embeds, attention_mask = stack_and_pad_left(full_embeddings)
+        attention_mask = torch.ones(inputs_embeds.shape[:2], device=self.device, dtype=torch.long)
+        
         outputs = self.llama_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
         
-        if hasattr(outputs, 'last_hidden_state'): last_hidden_state = outputs.last_hidden_state
-        elif hasattr(outputs, 'hidden_states'): last_hidden_state = outputs.hidden_states[-1]
-        else: raise AttributeError("Model output does not contain 'last_hidden_state' or 'hidden_states'.")
+        last_hidden_state = outputs.hidden_states[-1]
         
         sequence_lengths = attention_mask.sum(dim=1) - 1
-        batch_indices = torch.arange(len(full_embeddings), device=last_hidden_state.device)
+        batch_indices = torch.arange(batch_size, device=last_hidden_state.device)
         cls_input_hidden_state = last_hidden_state[batch_indices, sequence_lengths]
         
         classifier_dtype = next(self.classifier.parameters()).dtype
         logits = self.classifier(cls_input_hidden_state.to(classifier_dtype))
         
-        return logits, original_indices
+        return logits, batch_indices
 
-    def train_helper(self, labels, precomputed_embeddings):
-        self.train()
-        logits, original_indices = self.get_logits(precomputed_embeddings=precomputed_embeddings)
-        if logits is None: return torch.tensor([]), torch.tensor([])
-        valid_str_labels = [labels[i] for i in original_indices]
-        integer_labels = torch.tensor([1 if lbl == 'anomalous' else 0 for lbl in valid_str_labels], dtype=torch.long, device=logits.device)
-        return logits, integer_labels

@@ -22,7 +22,6 @@ class DatabaseManager:
         if not self.conn: return
         cursor = self.conn.cursor()
         try:
-            # --- FIX: Changed run_id to INTEGER and added nickname ---
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS runs (
                 run_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +62,18 @@ class DatabaseManager:
             print(f"Error creating new run: {e}")
             self.conn.rollback()
             return None
+        finally:
+            cursor.close()
+
+    def get_runs_by_nickname_prefix(self, prefix):
+        if not self.conn: return []
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM runs WHERE nickname LIKE ?", (f"{prefix}%",))
+            return [dict(run) for run in cursor.fetchall()]
+        except sqlite3.Error as e:
+            print(f"Error getting runs by prefix: {e}")
+            return []
         finally:
             cursor.close()
 
