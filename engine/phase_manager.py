@@ -36,9 +36,9 @@ def train_phase(controller, phase_name, n_epochs, lr, train_dataset, validation_
         train_dataset,
         batch_size=controller.hp['micro_batch_size'],
         sampler=sampler,
-        num_workers=min(os.cpu_count(), 16), # USE MULTIPLE CPU CORES
+        num_workers=min(os.cpu_count(), 16),
         pin_memory=True,
-        persistent_workers=True # AVOID PER-EPOCH OVERHEAD
+        persistent_workers=True
     )
     
     num_optimizer_steps = math.ceil(len(sampler) / controller.hp['batch_size']) * n_epochs
@@ -76,12 +76,10 @@ def train_phase(controller, phase_name, n_epochs, lr, train_dataset, validation_
             pbar.set_postfix(loss=loss.item() * grad_accum_steps)
             controller.batch_losses.append(loss.item() * grad_accum_steps)
 
-            # Update progress for UI
             time_elapsed_total = time.time() - controller.run_start_time
             time_elapsed_phase = time.time() - progress_state['phase_start_time']
             
             progress_overall = progress_state['global_step'] / progress_state['total_steps'] if progress_state['total_steps'] > 0 else 0
-            
             etc_overall = (time_elapsed_total / progress_overall) * (1 - progress_overall) if progress_overall > 0 else 0
             
             progress_phase = progress_state['phase_steps'] / progress_state['phase_total_steps'] if progress_state['phase_total_steps'] > 0 else 0

@@ -43,8 +43,7 @@ class TrainingController:
         self.batch_losses = []
         
         if self.is_test_run:
-            self.use_cached_embeddings = False
-            self._log(f"--- QUICK TEST RUN MODE ACTIVATED ({self.test_run_percentage*100:.0f}% data): Caching is enabled for this test run. ---")
+            self._log(f"--- QUICK TEST RUN MODE ACTIVATED ({self.test_run_percentage*100:.0f}% data): A separate cache file will be used for this run. ---")
 
     def _log(self, message):
         print(message)
@@ -102,44 +101,58 @@ class TrainingController:
         )
 
         tensorized_path = cacher.cache_file_path.with_suffix('.tensor.pt')
-        
-        use_cache = self.use_cached_embeddings or self.is_test_run
+        use_cache = self.use_cached_embeddings
 
         if tensorized_path.exists() and use_cache:
             self._log(f"Loading pre-tensorized dataset from {tensorized_path}")
             data = torch.load(tensorized_path)
             return TensorDataset(data['sequences'], data['labels'])
 
-        embeddings, labels = cacher.load_embeddings()
-        if not (embeddings and labels is not None and use_cache):
+        cached_embeddings, cached_labels = cacher.load_embeddings()
+        if not (cached_embeddings and cached_labels is not None and use_cache):
             self._log(f"No valid cache for {dataset_path.name}. Generating new embeddings...")
             
-            df = pd.read_csv(dataset_path)
-            if self.is_test_run:
-                df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-                subset_size = int(self.test_run_percentage * len(df))
-                df = df.head(subset_size)
-            
-            source_dataset = LogDataset(dataframe=df)
-            
-            encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_path)
-            encoder_model = AutoModel.from_pretrained(encoder_path).to(self.device).eval()
+            encoder_path_str = str(encoder_path)
+            encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_path_str, local_files_only=True)
+            encoder_model = AutoModel.from_pretrained(encoder_path_str, local_files_only=True).to(self.device).eval()
 
-            all_logs_flat, start_positions = merge_data(source_dataset.sequences)
-            all_line_embeddings = []
-            with torch.no_grad():
-                for i in tqdm(range(0, len(all_logs_flat), 256), desc=f"Embedding {dataset_path.name}"):
-                    batch_logs = all_logs_flat[i:i+256]
-                    inputs = encoder_tokenizer(batch_logs, return_tensors="pt", padding=True, truncation=True, max_length=self.hp['max_content_len']).to(self.device)
-                    model_output = encoder_model(**inputs)
-                    line_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
-                    all_line_embeddings.append(line_embeddings.cpu())
+            all_embeddings = []
+            all_labels = []
             
-            all_line_embeddings_tensor = torch.cat(all_line_embeddings, dim=0)
-            embeddings = list(torch.tensor_split(all_line_embeddings_tensor, start_positions[1:]))
-            labels = source_dataset.get_all_labels()
+            is_gui_mode = self.callback != TrainingController.__init__.__defaults__[0] 
             
-            cacher.save_embeddings(embeddings, labels)
+            with pd.read_csv(dataset_path, chunksize=100000) as reader:
+                pbar = tqdm(reader, desc=f"Embedding {dataset_path.name}", disable=is_gui_mode, unit=" chunks")
+                for i, chunk_df in enumerate(pbar):
+                    if self.is_test_run:
+                        chunk_df = chunk_df.sample(frac=self.test_run_percentage, random_state=42)
+
+                    source_dataset = LogDataset(dataframe=chunk_df)
+                    sequences_in_chunk = source_dataset.sequences
+                    labels_in_chunk = source_dataset.get_all_labels()
+                    
+                    sequence_batch_size = 256
+                    for j in range(0, len(sequences_in_chunk), sequence_batch_size):
+                        batch_of_sequences = sequences_in_chunk[j:j+sequence_batch_size]
+                        if not batch_of_sequences or not any(batch_of_sequences): continue
+                        
+                        all_logs_flat, start_positions = merge_data(batch_of_sequences)
+                        if not all_logs_flat: continue
+
+                        with torch.no_grad():
+                            inputs = encoder_tokenizer(all_logs_flat, return_tensors="pt", padding=True, truncation=True, max_length=self.hp['max_content_len']).to(self.device)
+                            model_output = encoder_model(**inputs)
+                            line_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
+                        
+                        sequence_tensors = list(torch.tensor_split(line_embeddings.cpu(), start_positions[1:]))
+                        all_embeddings.extend(sequence_tensors)
+
+                    all_labels.extend(labels_in_chunk)
+                    if is_gui_mode:
+                        progress = min((i + 1) / pbar.total, 1.0) if pbar.total and pbar.total > 0 else 0
+                        self.callback({"embedding_status": f"Processing data chunk {i+1}/{pbar.total}", "embedding_progress": progress})
+
+            cacher.save_embeddings(all_embeddings, all_labels)
             self._cleanup(model_to_clean=encoder_model)
             del encoder_tokenizer
 
@@ -150,7 +163,7 @@ class TrainingController:
             return TensorDataset(data['sequences'], data['labels'])
         else:
             raise RuntimeError(f"Failed to create tensorized dataset for {dataset_path.name}")
-
+            
     def run(self):
         monitor = ResourceMonitor()
         monitor.start()
@@ -161,7 +174,7 @@ class TrainingController:
             self.run_start_time = time.time()
             
             encoder_path = DEFAULT_BERT_PATH
-            encoder_config = AutoConfig.from_pretrained(encoder_path)
+            encoder_config = AutoConfig.from_pretrained(str(encoder_path), local_files_only=True)
             self.hp['encoder_hidden_size'] = encoder_config.hidden_size
 
             self._log("Preparing datasets (on-demand)...")
@@ -182,7 +195,6 @@ class TrainingController:
             if compile_model:
                 self._log("Linux detected. Enabling torch.compile() for optimized performance.")
 
-            # Initialize progress state
             progress_state = {
                 'global_step': 0,
                 'total_steps': 0,
@@ -191,20 +203,17 @@ class TrainingController:
                 'phase_start_time': 0
             }
 
-            # Calculate total steps for the progress bar
             for phase_epochs in [self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('n_epochs_phase_full', 0)]:
                 if phase_epochs > 0:
                     sampler = BalancedSampler(train_dataset.tensors[1].numpy(), self.hp.get('min_less_portion', 0.5))
                     loader = DataLoader(train_dataset, batch_size=self.hp['micro_batch_size'], sampler=sampler)
                     progress_state['total_steps'] += len(loader) * phase_epochs
 
-            # Phase 1
             self.model = LogSentinelModel(self.model_name, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device)
             if compile_model: self.model = torch.compile(self.model, mode="max-autotune")
             self.model.set_train_projector_and_classifier()
             success, ft_path = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, progress_state)
 
-            # Phase 2
             if success:
                 self._cleanup(self.model)
                 self.model = LogSentinelModel(self.model_name, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device)
@@ -213,7 +222,6 @@ class TrainingController:
                 _, ft_path = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, progress_state)
                 self._cleanup(self.model)
 
-            # Evaluation
             self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
             self.model = LogSentinelModel(self.model_name, self.hp['encoder_hidden_size'], self.hp, ft_path, False, self.device)
             if compile_model: self.model = torch.compile(self.model, mode="max-autotune")
@@ -248,4 +256,3 @@ class TrainingController:
                 self.db.update_run_status(self.run_id, final_status, str(self.report_dir) if final_status == 'COMPLETED' else None)
             if self.model: self._cleanup(self.model)
             if self.callback: self.callback({"status": final_status, "done": True})
-

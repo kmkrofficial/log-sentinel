@@ -53,39 +53,50 @@ class InferenceController:
 
     def _prepare_inference_data(self, input_file_path):
         self._log("Preparing inference data...")
-        df = pd.read_csv(input_file_path)
         
-        # This is the critical bug fix: apply the same preprocessing as in training
-        df['Processed_Content'] = df['Content'].apply(replace_patterns)
+        encoder_path_str = str(DEFAULT_BERT_PATH)
+        encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_path_str, local_files_only=True)
+        encoder_model = AutoModel.from_pretrained(encoder_path_str, local_files_only=True).to(self.device).eval()
+
+        all_embeddings = []
+        all_labels = []
         
-        sequences = [content.split(' ;-; ') for content in df['Processed_Content'].values]
-        labels = df['Label'].fillna(-1).astype(int).values if 'Label' in df.columns else np.full(len(sequences), -1, dtype=int)
+        is_gui_mode = self.callback != InferenceController.__init__.__defaults__[0]
 
-        # Generate embeddings
-        encoder_path = DEFAULT_BERT_PATH
-        encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_path)
-        encoder_model = AutoModel.from_pretrained(encoder_path).to(self.device).eval()
+        with pd.read_csv(input_file_path, chunksize=100000) as reader:
+            pbar = tqdm(reader, desc="Generating Embeddings", disable=is_gui_mode, unit=" chunks")
+            for i, chunk_df in enumerate(pbar):
+                chunk_df['Processed_Content'] = chunk_df['Content'].apply(replace_patterns)
+                sequences = [content.split(' ;-; ') for content in chunk_df['Processed_Content'].values]
+                labels = chunk_df['Label'].fillna(-1).astype(int).values if 'Label' in chunk_df.columns else np.full(len(sequences), -1, dtype=int)
+                
+                sequence_batch_size = 256
+                for j in range(0, len(sequences), sequence_batch_size):
+                    batch_of_sequences = sequences[j:j+sequence_batch_size]
+                    if not batch_of_sequences or not any(batch_of_sequences): continue
+                    
+                    all_logs_flat, start_positions = merge_data(batch_of_sequences)
+                    if not all_logs_flat: continue
 
-        all_logs_flat, start_positions = merge_data(sequences)
-        all_line_embeddings = []
-        with torch.no_grad():
-            for i in tqdm(range(0, len(all_logs_flat), 256), desc="Generating Embeddings"):
-                batch_logs = all_logs_flat[i:i+256]
-                inputs = encoder_tokenizer(batch_logs, return_tensors="pt", padding=True, truncation=True, max_length=self.hyperparameters['max_content_len']).to(self.device)
-                model_output = encoder_model(**inputs)
-                line_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
-                all_line_embeddings.append(line_embeddings.cpu())
+                    with torch.no_grad():
+                        inputs = encoder_tokenizer(all_logs_flat, return_tensors="pt", padding=True, truncation=True, max_length=self.hyperparameters['max_content_len']).to(self.device)
+                        model_output = encoder_model(**inputs)
+                        line_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
 
-        all_line_embeddings_tensor = torch.cat(all_line_embeddings, dim=0)
-        embeddings = list(torch.tensor_split(all_line_embeddings_tensor, start_positions[1:]))
+                    sequence_tensors = list(torch.tensor_split(line_embeddings.cpu(), start_positions[1:]))
+                    all_embeddings.extend(sequence_tensors)
 
+                all_labels.extend(labels)
+                if is_gui_mode:
+                    progress = min((i + 1) / pbar.total, 1.0) if pbar.total and pbar.total > 0 else 0
+                    self.callback({"embedding_status": f"Processing data chunk {i+1}/{pbar.total}", "embedding_progress": progress})
+        
         del encoder_model, encoder_tokenizer
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Tensorize the embeddings
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as tmp:
-            torch.save({'embeddings': embeddings, 'labels': torch.from_numpy(labels)}, tmp.name)
+            torch.save({'embeddings': all_embeddings, 'labels': torch.tensor(all_labels)}, tmp.name)
             tmp_path = Path(tmp.name)
         
         tensorize_dataset(tmp_path, self.hyperparameters['max_seq_len'])
@@ -127,7 +138,7 @@ class InferenceController:
                 if (dataset.tensors[1] == -1).all():
                     raise ValueError("Testing mode requires a 'Label' column with valid labels.")
                 perf_metrics = evaluate_and_visualize(self, dataset, "test")
-            else: # Inference mode
+            else: 
                 all_probas = []
                 loader = DataLoader(dataset, batch_size=internal_batch_size)
                 with torch.no_grad():
@@ -170,4 +181,3 @@ class InferenceController:
                 self.db.update_run_status(self.run_id, final_status, str(report_dir) if final_status == 'COMPLETED' else None)
             
             if self.callback: self.callback({"status": final_status, "done": True, "result": results})
-

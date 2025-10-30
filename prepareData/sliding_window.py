@@ -4,7 +4,7 @@ import numpy as np
 from helper import fixedSize_window, structure_log
 
 # --- Script Configuration ---
-data_dir = r'/media/koganrath/primary_drive/log-sentinel/datasets/BGL'
+data_dir = r'/home/koganrath/Personal/coding/loghub-logs/BGL'
 log_name = "BGL.log"
 output_dir = data_dir
 
