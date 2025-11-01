@@ -11,7 +11,7 @@ from pathlib import Path
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from torch.utils.data import TensorDataset, DataLoader
 
-from config import REPORTS_DIR, DEFAULT_BERT_PATH
+from config import REPORTS_DIR, MODELS_DIR, DEFAULT_ENCODER_MODEL, DEFAULT_LLAMA_MODEL, get_hyperparameters
 from utils.database_manager import DatabaseManager
 from utils.data_loader import LogDataset, replace_patterns
 from utils.resource_monitor import ResourceMonitor
@@ -22,14 +22,16 @@ from utils.helpers import merge_data
 from engine.phase_manager import train_phase, evaluate_and_visualize
 from engine.data_utils import BalancedSampler
 from prepareData.tensorize_embeddings import tensorize_dataset
+from utils.model_downloader import get_model_path
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
 class TrainingController:
-    def __init__(self, model_name, dataset_name, hyperparameters, db_manager, callback=None, use_cached_embeddings=True, is_test_run=False, test_run_percentage=0.3):
-        self.model_name = model_name
+    def __init__(self, llama_model_name, dataset_name, db_manager, callback=None, use_cached_embeddings=True, is_test_run=False, test_run_percentage=0.3):
         self.dataset_name = dataset_name
-        self.hp = hyperparameters
+        self.hp = get_hyperparameters(dataset_name)
+        self.llama_model_name = llama_model_name or DEFAULT_LLAMA_MODEL
+        self.encoder_model_name = DEFAULT_ENCODER_MODEL
         self.db = db_manager
         self.callback = callback or (lambda *args: 'CONTINUE')
         self.run_id = None
@@ -41,6 +43,7 @@ class TrainingController:
         self.is_test_run = is_test_run
         self.test_run_percentage = test_run_percentage
         self.batch_losses = []
+        self.num_workers = self.hp.get('dataloader_num_workers', 0)
         
         if self.is_test_run:
             self._log(f"--- QUICK TEST RUN MODE ACTIVATED ({self.test_run_percentage*100:.0f}% data): A separate cache file will be used for this run. ---")
@@ -50,7 +53,7 @@ class TrainingController:
         if self.callback: self.callback({"log": message})
 
     def _generate_nickname(self):
-        model_name_short = self.model_name.split('/')[-1]
+        model_name_short = self.llama_model_name.split('/')[-1]
         base_nickname = f"{model_name_short}-{self.dataset_name}"
         if self.is_test_run:
             base_nickname += f"-{int(self.test_run_percentage * 100)}pct_TEST"
@@ -70,7 +73,7 @@ class TrainingController:
         
         nickname = self._generate_nickname()
 
-        self.run_id = self.db.create_new_run('Training', self.model_name, self.dataset_name, self.hp, nickname)
+        self.run_id = self.db.create_new_run('Training', self.llama_model_name, self.dataset_name, self.hp, nickname)
         if self.run_id:
             self._log(f"Created new training run with ID: {self.run_id} (Nickname: {nickname})")
             self.report_dir = REPORTS_DIR / str(self.run_id)
@@ -81,20 +84,18 @@ class TrainingController:
     def _cleanup(self, model_to_clean=None):
         target = model_to_clean if model_to_clean else self.model
         if target:
-            self._log(f"Cleaning up model: {type(target).__name__}...")
             del target
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
-        self._log("Cleanup complete.")
 
     def _mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output[0]
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
-    def _get_or_create_embeddings(self, dataset_path, encoder_path):
+    def _get_or_create_embeddings(self, dataset_path, encoder_path_str):
         cacher = EmbeddingCacher(
-            encoder_name=encoder_path.name,
+            encoder_name=Path(encoder_path_str).name,
             dataset_path=dataset_path,
             is_test_run=self.is_test_run,
             test_run_percentage=self.test_run_percentage if self.is_test_run else None
@@ -112,9 +113,8 @@ class TrainingController:
         if not (cached_embeddings and cached_labels is not None and use_cache):
             self._log(f"No valid cache for {dataset_path.name}. Generating new embeddings...")
             
-            encoder_path_str = str(encoder_path)
-            encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_path_str, local_files_only=True)
-            encoder_model = AutoModel.from_pretrained(encoder_path_str, local_files_only=True).to(self.device).eval()
+            encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_path_str)
+            encoder_model = AutoModel.from_pretrained(encoder_path_str).to(self.device).eval()
 
             all_embeddings = []
             all_labels = []
@@ -173,8 +173,11 @@ class TrainingController:
                 raise RuntimeError("Failed to create a new run record.")
             self.run_start_time = time.time()
             
-            encoder_path = DEFAULT_BERT_PATH
-            encoder_config = AutoConfig.from_pretrained(str(encoder_path), local_files_only=True)
+            self._log("Ensuring models are available...")
+            encoder_path_str = get_model_path(self.encoder_model_name, MODELS_DIR, self._log)
+            get_model_path(self.llama_model_name, MODELS_DIR, self._log)
+            
+            encoder_config = AutoConfig.from_pretrained(encoder_path_str)
             self.hp['encoder_hidden_size'] = encoder_config.hidden_size
 
             self._log("Preparing datasets (on-demand)...")
@@ -182,9 +185,9 @@ class TrainingController:
             val_dataset_path = Path("datasets") / self.dataset_name / 'validation.csv'
             test_dataset_path = Path("datasets") / self.dataset_name / 'test.csv'
 
-            train_dataset = self._get_or_create_embeddings(train_dataset_path, encoder_path)
-            validation_dataset = self._get_or_create_embeddings(val_dataset_path, encoder_path) if val_dataset_path.exists() else None
-            test_dataset = self._get_or_create_embeddings(test_dataset_path, encoder_path) if test_dataset_path.exists() else None
+            train_dataset = self._get_or_create_embeddings(train_dataset_path, encoder_path_str)
+            validation_dataset = self._get_or_create_embeddings(val_dataset_path, encoder_path_str) if val_dataset_path.exists() else None
+            test_dataset = self._get_or_create_embeddings(test_dataset_path, encoder_path_str) if test_dataset_path.exists() else None
 
             if not train_dataset:
                 raise RuntimeError("Training dataset could not be loaded or created.")
@@ -209,21 +212,21 @@ class TrainingController:
                     loader = DataLoader(train_dataset, batch_size=self.hp['micro_batch_size'], sampler=sampler)
                     progress_state['total_steps'] += len(loader) * phase_epochs
 
-            self.model = LogSentinelModel(self.model_name, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device)
+            self.model = LogSentinelModel(self.llama_model_name, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
             if compile_model: self.model = torch.compile(self.model, mode="max-autotune")
             self.model.set_train_projector_and_classifier()
             success, ft_path = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, progress_state)
 
             if success:
                 self._cleanup(self.model)
-                self.model = LogSentinelModel(self.model_name, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device)
+                self.model = LogSentinelModel(self.llama_model_name, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
                 if compile_model: self.model = torch.compile(self.model, mode="max-autotune")
                 self.model.set_finetuning_all()
                 _, ft_path = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, progress_state)
                 self._cleanup(self.model)
 
             self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
-            self.model = LogSentinelModel(self.model_name, self.hp['encoder_hidden_size'], self.hp, ft_path, False, self.device)
+            self.model = LogSentinelModel(self.llama_model_name, self.hp['encoder_hidden_size'], self.hp, ft_path, False, self.device, self._log)
             if compile_model: self.model = torch.compile(self.model, mode="max-autotune")
             
             final_metrics = {}

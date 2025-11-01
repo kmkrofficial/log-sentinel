@@ -1,144 +1,201 @@
 import torch
-import time
-import math
-import numpy as np
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
-from torch.utils.data import DataLoader
-import bitsandbytes as bnb
+import time
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+import numpy as np
 import os
+import gc
 
-from engine.data_utils import FocalLoss, BalancedSampler
+from engine.data_utils import BalancedSampler, FocalLoss
+from utils.helpers import format_time, get_eta
 
-def train_phase(controller, phase_name, n_epochs, lr, train_dataset, validation_dataset, progress_state):
-    if not n_epochs > 0:
+def train_phase(controller, phase_name, num_epochs, learning_rate, train_dataset, validation_dataset, progress_state):
+    if num_epochs == 0:
+        controller._log(f"Skipping {phase_name} phase (0 epochs).")
         return True, None
 
-    controller._log(f"\n--- Starting Training Phase: {phase_name} (max {n_epochs} epochs) ---")
+    controller._log(f"\n>>>> STARTING {phase_name.upper()} PHASE <<<<")
+    controller._log(f"Epochs: {num_epochs}, LR: {learning_rate}, Num Workers: {controller.num_workers}")
     
-    patience = controller.hp.get("early_stopping_patience", 2)
-    min_delta = controller.hp.get("early_stopping_min_delta", 0.0)
-    patience_counter = 0
-    best_score = -1.0
-    temp_best_model_dir = controller.report_dir / f"phase_{phase_name}_model"
-
-    criterion = FocalLoss(alpha=0.25, gamma=2.0)
+    optimizer = torch.optim.AdamW(controller.model.parameters(), lr=learning_rate)
+    criterion = FocalLoss()
     
-    trainable_params = [p for p in controller.model.parameters() if p.requires_grad]
-    if not trainable_params:
-        controller._log(f"Phase '{phase_name}' has no trainable parameters, skipping.")
-        return True, None
-    
-    optimizer = bnb.optim.PagedAdamW8bit(trainable_params, lr=lr)
-    
-    sampler = BalancedSampler(train_dataset.tensors[1].numpy(), controller.hp.get('min_less_portion', 0.5))
+    sampler = BalancedSampler(train_dataset.tensors[1].numpy(), controller.hp['min_less_portion'])
     train_loader = DataLoader(
         train_dataset,
         batch_size=controller.hp['micro_batch_size'],
         sampler=sampler,
-        num_workers=min(os.cpu_count(), 16),
+        num_workers=controller.num_workers,
         pin_memory=True,
-        persistent_workers=True
+        drop_last=True
     )
     
-    num_optimizer_steps = math.ceil(len(sampler) / controller.hp['batch_size']) * n_epochs
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, total_steps=num_optimizer_steps, pct_start=0.1)
+    best_metric = -1
+    patience_counter = 0
+    best_model_path = None
+    metric_key = controller.hp['early_stopping_metric']
+    min_delta = controller.hp['early_stopping_min_delta']
     
-    grad_accum_steps = controller.hp['batch_size'] // controller.hp['micro_batch_size']
-    
+    progress_state['phase_total_steps'] = len(train_loader) * num_epochs
     progress_state['phase_steps'] = 0
-    progress_state['phase_total_steps'] = len(train_loader) * n_epochs
-    progress_state['phase_start_time'] = time.time()
-    
-    for epoch in range(int(n_epochs)):
-        controller.model.train()
-        controller._log(f"--- Epoch {epoch + 1}/{int(n_epochs)} ({phase_name}) ---")
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} Training")
-        for batch_idx, (sequences, labels) in enumerate(pbar):
-            progress_state['global_step'] += 1
-            progress_state['phase_steps'] += 1
 
-            sequences = sequences.to(controller.device)
-            labels = labels.to(controller.device)
+    for epoch in range(num_epochs):
+        controller._log(f"\n--- Epoch {epoch + 1}/{num_epochs} ({phase_name}) ---")
+        controller.model.train()
+        
+        epoch_loss = 0
+        epoch_start_time = time.time()
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}", disable=controller.callback != TrainingController.__init__.__defaults__[0])
+        
+        for i, (sequences, labels) in enumerate(pbar):
+            progress_state['phase_start_time'] = progress_state.get('phase_start_time', time.time())
             
-            logits, _ = controller.model.get_logits(sequence_tensor_batch=sequences)
-            loss = criterion(logits, labels) / grad_accum_steps
+            sequences, labels = sequences.to(controller.device, non_blocking=True), labels.to(controller.device, non_blocking=True)
+            
+            optimizer.zero_grad()
+            
+            logits, _ = controller.model.get_logits(sequences)
+            loss = criterion(logits, labels)
             
             loss.backward()
+            optimizer.step()
             
-            if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+            batch_loss = loss.item()
+            epoch_loss += batch_loss
+            controller.batch_losses.append(batch_loss)
             
-            pbar.set_postfix(loss=loss.item() * grad_accum_steps)
-            controller.batch_losses.append(loss.item() * grad_accum_steps)
+            progress_state['global_step'] += 1
+            progress_state['phase_steps'] += 1
+            
+            if i % 20 == 0:
+                metrics = {
+                    'loss': batch_loss,
+                    'lr': optimizer.param_groups[0]['lr']
+                }
+                eta_str = get_eta(progress_state['phase_start_time'], progress_state['phase_steps'], progress_state['phase_total_steps'])
+                if not pbar.disable:
+                    pbar.set_postfix(metrics)
+                    controller.callback({
+                        "progress": progress_state['global_step'] / progress_state['total_steps'],
+                        "status": f"Epoch {epoch+1} ({phase_name}) - Batch {i+1}/{len(train_loader)} - ETA: {eta_str}",
+                        "metrics": metrics
+                    })
 
-            time_elapsed_total = time.time() - controller.run_start_time
-            time_elapsed_phase = time.time() - progress_state['phase_start_time']
-            
-            progress_overall = progress_state['global_step'] / progress_state['total_steps'] if progress_state['total_steps'] > 0 else 0
-            etc_overall = (time_elapsed_total / progress_overall) * (1 - progress_overall) if progress_overall > 0 else 0
-            
-            progress_phase = progress_state['phase_steps'] / progress_state['phase_total_steps'] if progress_state['phase_total_steps'] > 0 else 0
-            etc_phase = (time_elapsed_phase / progress_phase) * (1 - progress_phase) if progress_phase > 0 else 0
-            
-            status = {
-                "epoch": f"Epoch {epoch + 1}/{int(n_epochs)} ({phase_name})",
-                "progress": progress_overall,
-                "loss": loss.item() * grad_accum_steps,
-                "time_elapsed": time_elapsed_total,
-                "etc_overall": etc_overall,
-                "etc_phase": etc_phase
-            }
-            if controller.callback(status) == 'STOP':
-                controller._log("Stop request received.")
-                pbar.close()
-                return False, temp_best_model_dir
+        avg_epoch_loss = epoch_loss / len(train_loader)
+        epoch_time = time.time() - epoch_start_time
+        controller._log(f"Epoch {epoch + 1} Complete. Avg Loss: {avg_epoch_loss:.4f}, Time: {format_time(epoch_time)}")
 
         if validation_dataset:
-            val_metrics = evaluate_and_visualize(controller, validation_dataset, f"epoch_{epoch+1}_val")
-            current_score = val_metrics[f"epoch_{epoch+1}_val"]['overall']['f1_score']
-            controller._log(f"Epoch {epoch+1} Validation F1-Score: {current_score:.4f} (Best: {best_score:.4f})")
+            controller._log("Running validation...")
+            val_metrics = evaluate(controller, validation_dataset, "validation", epoch)
             
-            if current_score - best_score > min_delta:
-                best_score = current_score
+            current_metric = val_metrics[f'val_{metric_key}']
+            
+            if current_metric > best_metric + min_delta:
+                best_metric = current_metric
                 patience_counter = 0
-                controller.model.save_ft_model(temp_best_model_dir)
-                controller._log(f"New best score! Saving model state.")
+                controller._log(f"New best model! {metric_key.capitalize()}: {best_metric:.4f}. Saving model...")
+                
+                temp_model_dir = os.path.join(controller.report_dir, f"temp_model_{phase_name}")
+                controller.model.save_ft_model(temp_model_dir)
+                best_model_path = temp_model_dir
             else:
                 patience_counter += 1
-                if patience_counter >= patience:
-                    controller._log(f"EARLY STOPPING: Validation score has not improved for {patience} epochs.")
-                    break
-    
-    return True, temp_best_model_dir
+                controller._log(f"No improvement. {metric_key.capitalize()}: {current_metric:.4f}. Patience: {patience_counter}/{controller.hp['early_stopping_patience']}")
 
-def evaluate_and_visualize(controller, dataset, dataset_name_prefix):
-    controller._log(f"\n--- Starting Evaluation on {dataset_name_prefix.capitalize()} Set ---")
+            if patience_counter >= controller.hp['early_stopping_patience']:
+                controller._log("Early stopping triggered.")
+                break
+    
+    if not best_model_path and not validation_dataset:
+        controller._log("No validation dataset. Saving final model for phase.")
+        temp_model_dir = os.path.join(controller.report_dir, f"temp_model_{phase_name}")
+        controller.model.save_ft_model(temp_model_dir)
+        best_model_path = temp_model_dir
+
+    return True, best_model_path
+
+
+def evaluate(controller, dataset, dataset_name, epoch=-1):
     controller.model.eval()
     
-    all_preds, all_probas = [], []
-    gt_labels = dataset.tensors[1].numpy()
+    loader = DataLoader(
+        dataset,
+        batch_size=controller.hp['micro_batch_size'] * 2,
+        num_workers=controller.num_workers,
+        pin_memory=True
+    )
     
-    eval_loader = DataLoader(dataset, batch_size=controller.hp['batch_size'])
-
+    all_preds = []
+    all_labels = []
+    
     with torch.no_grad():
-        for sequences, _ in tqdm(eval_loader, desc=f"Evaluating {dataset_name_prefix.capitalize()} Set"):
-            sequences = sequences.to(controller.device)
-            logits, _ = controller.model.get_logits(sequence_tensor_batch=sequences)
-            if logits is not None:
-                probas = torch.softmax(logits, dim=-1)
-                all_probas.extend(probas[:, 1].cpu().numpy())
-                all_preds.extend(torch.argmax(logits, dim=-1).cpu().numpy())
-    
-    p, r, f1, _ = precision_recall_fscore_support(gt_labels, all_preds, average='binary', pos_label=1, zero_division=0)
-    metrics = {"overall": {"accuracy": accuracy_score(gt_labels, all_preds), "precision": p, "recall": r, "f1_score": f1}}
-    
-    controller.visualizer.plot_confusion_matrix(confusion_matrix(gt_labels, all_preds), ['Normal', 'Anomalous'], filename_prefix=dataset_name_prefix)
-    controller.visualizer.plot_roc_curve(gt_labels, np.array(all_probas), filename_prefix=dataset_name_prefix)
-    controller.visualizer.plot_overall_metrics(metrics['overall'], filename_prefix=dataset_name_prefix)
+        for sequences, labels in tqdm(loader, desc=f"Evaluating {dataset_name}", disable=controller.callback != TrainingController.__init__.__defaults__[0]):
+            sequences = sequences.to(controller.device, non_blocking=True)
+            
+            logits, _ = controller.model.get_logits(sequences)
+            
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
 
-    return {dataset_name_prefix: metrics}
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', zero_division=0)
+    
+    metrics = {
+        f'{dataset_name}_accuracy': accuracy,
+        f'{dataset_name}_precision': precision,
+        f'{dataset_name}_recall': recall,
+        f'{dataset_name}_f1_score': f1
+    }
+    
+    controller._log(f"Validation Metrics (Epoch {epoch+1}): " + ", ".join([f"{k}: {v:.4f}" for k, v in metrics.items()]))
+    
+    if controller.callback:
+        controller.callback({"validation_metrics": metrics})
+        
+    return metrics
+
+def evaluate_and_visualize(controller, dataset, dataset_name):
+    controller._log(f"Running final evaluation on {dataset_name} dataset...")
+    
+    start_time = time.time()
+    metrics = evaluate(controller, dataset, dataset_name, epoch=999)
+    eval_time = time.time() - start_time
+    
+    metrics[f'{dataset_name}_inference_time_sec'] = eval_time
+    metrics[f'{dataset_name}_samples_per_sec'] = len(dataset) / eval_time
+    
+    controller._log(f"Final {dataset_name.upper()} Metrics: ")
+    for k, v in metrics.items():
+        controller._log(f"  {k}: {v:.4f}")
+        
+    if controller.visualizer:
+        try:
+            loader = DataLoader(dataset, batch_size=controller.hp['micro_batch_size'], shuffle=False, num_workers=controller.num_workers, pin_memory=True)
+            
+            all_labels = []
+            all_probs = []
+            
+            controller.model.eval()
+            with torch.no_grad():
+                for sequences, labels in tqdm(loader, desc=f"Generating plots for {dataset_name}", disable=True):
+                    sequences = sequences.to(controller.device, non_blocking=True)
+                    logits, _ = controller.model.get_logits(sequences)
+                    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                    all_probs.extend(probs)
+                    all_labels.extend(labels.cpu().numpy())
+
+            all_preds = (np.array(all_probs) > 0.5).astype(int)
+
+            controller.visualizer.plot_confusion_matrix(all_labels, all_preds, f"{dataset_name}_confusion_matrix")
+            controller.visualizer.plot_roc_curve(all_labels, all_probs, f"{dataset_name}_roc_curve")
+            controller.visualizer.plot_precision_recall_curve(all_labels, all_probs, f"{dataset_name}_pr_curve")
+            controller.visualizer.plot_distributions(all_probs, all_labels, f"{dataset_name}_distributions")
+        except Exception as e:
+            controller._log(f"Failed to generate plots for {dataset_name}: {e}")
+
+    return {dataset_name: metrics}

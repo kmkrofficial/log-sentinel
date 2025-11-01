@@ -10,12 +10,13 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*You passed `quantization_config`.*")
 
 class LogSentinelModel(nn.Module):
-    def __init__(self, llama_path, encoder_hidden_size, hyperparameters, ft_path=None, is_train_mode=True, device=None):
+    def __init__(self, llama_model_name, encoder_hidden_size, hyperparameters, ft_path=None, is_train_mode=True, device=None, log_callback=None):
         super().__init__()
         self.device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.hp = hyperparameters
+        self.log_callback = log_callback or print
 
-        self.llama_model, self.llama_tokenizer = load_model_and_tokenizer(llama_path, is_train_mode)
+        self.llama_model, self.llama_tokenizer = load_model_and_tokenizer(llama_model_name, is_train_mode, self.log_callback)
 
         projector_device = self.llama_model.device
         compute_dtype = self.llama_model.dtype
@@ -60,7 +61,10 @@ class LogSentinelModel(nn.Module):
             raise e
 
     def _log(self, message):
-        print(message)
+        if self.log_callback:
+            self.log_callback(message)
+        else:
+            print(message)
 
     def save_ft_model(self, path):
         os.makedirs(path, exist_ok=True)
@@ -103,10 +107,9 @@ class LogSentinelModel(nn.Module):
         
         sequence_lengths = attention_mask.sum(dim=1) - 1
         batch_indices = torch.arange(batch_size, device=last_hidden_state.device)
-        cls_input_hidden_state = last_hidden_state[batch_indices, sequence_lengths]
+        cls_input_hidden_state = last_.hidden_states[batch_indices, sequence_lengths]
         
         classifier_dtype = next(self.classifier.parameters()).dtype
         logits = self.classifier(cls_input_hidden_state.to(classifier_dtype))
         
         return logits, batch_indices
-
