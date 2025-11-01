@@ -4,12 +4,33 @@ import numpy as np
 from helper import fixedSize_window, structure_log
 
 # --- Script Configuration ---
-data_dir = r'/home/koganrath/Personal/coding/loghub-logs/BGL'
-log_name = "BGL.log"
+# data_dir = r'/home/koganrath/Personal/coding/loghub-logs/BGL'
+# log_name = "BGL.log"
+
+# Liberty
+# data_dir = r'/home/koganrath/Personal/coding/loghub-logs/liberty'
+# log_name = "liberty2"
+
+# Thunderbird
+data_dir = r'/home/koganrath/Personal/coding/loghub-logs/thunderbird'
+log_name = "Thunderbird.log"
+
 output_dir = data_dir
 
-start_line = 0
-end_line = 100000000 
+# BGL Dataset
+# start_line = 0
+# end_line = 100000000 
+
+
+# Liberty Dataset
+# start_line = 40000000
+# end_line = 45000000
+
+
+# Thunderbird dataset
+start_line = 160000000
+end_line = 170000000
+
 
 window_size = 100
 step_size = 100

@@ -1,22 +1,29 @@
 from pathlib import Path
+import psutil
 
 ROOT_DIR = Path(__file__).resolve().parent
 
 DATA_CACHE_DIR = ROOT_DIR / 'logsentinel_data'
 DATA_DIR = ROOT_DIR / 'datasets'
 MODELS_DIR = ROOT_DIR / 'models'
-REPORTS_DIR = ROOT_DIR / 'reports'
+EXECUTIONS_DIR = ROOT_DIR / 'executions'
 UTILS_DIR = ROOT_DIR / 'utils'
 
-EMBEDDING_CACHE_DIR = DATA_CACHE_DIR / 'embedding_cache'
 TEMP_MODELS_DIR = DATA_CACHE_DIR / 'temp_models'
 DB_PATH = ROOT_DIR / 'logsentinel.db'
 
-for dir_path in [DATA_DIR, MODELS_DIR, REPORTS_DIR, EMBEDDING_CACHE_DIR, TEMP_MODELS_DIR]:
+for dir_path in [DATA_DIR, MODELS_DIR, EXECUTIONS_DIR, DATA_CACHE_DIR, TEMP_MODELS_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_LLAMA_MODEL = "meta-llama/Meta-Llama-3.2-1B"
+DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B"
+
+def get_optimal_workers():
+    try:
+        cpu_count = psutil.cpu_count(logical=True)
+        return max(4, min(cpu_count, 16))
+    except Exception:
+        return 4
 
 BASE_HYPERPARAMETERS = {
     "n_epochs_phase_adapters": 5,
@@ -31,7 +38,7 @@ BASE_HYPERPARAMETERS = {
     "early_stopping_patience": 3,
     "early_stopping_metric": "f1_score",
     "early_stopping_min_delta": 0.005,
-    "dataloader_num_workers": 4,
+    "dataloader_num_workers": get_optimal_workers(),
 }
 
 DATASET_HYPERPARAMETERS = {
@@ -60,9 +67,8 @@ DATASET_HYPERPARAMETERS = {
 }
 
 def get_hyperparameters(dataset_name: str) -> dict:
-    if dataset_name not in DATASET_HYPERPARAMETERS:
-        dataset_name = "default"
+    specific_hp = DATASET_HYPERPARAMETERS.get(dataset_name, DATASET_HYPERPARAMETERS["default"])
         
     hp = BASE_HYPERPARAMETERS.copy()
-    hp.update(DATASET_HYPERPARAMETERS[dataset_name])
+    hp.update(specific_hp)
     return hp

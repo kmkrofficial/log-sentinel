@@ -1,183 +1,219 @@
 import os
 import gc
+import torch
 import time
 import shutil
-import platform
-import tempfile
-import numpy as np
 import pandas as pd
-import torch
 import traceback
-from pathlib import Path
+import platform
+import numpy as np
 from tqdm import tqdm
+from pathlib import Path
+from transformers import AutoTokenizer, AutoModel, AutoConfig
 from torch.utils.data import TensorDataset, DataLoader
-from transformers import AutoTokenizer, AutoModel
 
-from config import REPORTS_DIR, DEFAULT_BERT_PATH
+from config import (
+    EXECUTIONS_DIR, MODELS_DIR, DEFAULT_ENCODER_MODEL, 
+    DEFAULT_LLAMA_MODEL, get_hyperparameters
+)
 from utils.database_manager import DatabaseManager
-from utils.data_loader import LogDataset, replace_patterns
-from utils.helpers import merge_data
-from utils.embedding_cacher import EmbeddingCacher
-from prepareData.tensorize_embeddings import tensorize_dataset
+from utils.data_loader import LogDataset
+from utils.resource_monitor import ResourceMonitor
+from utils.log_visualizer import LogVisualizer
 from logsentinel_model import LogSentinelModel
+from utils.helpers import merge_data, get_eta, format_time
+from engine.data_utils import BalancedSampler
 
+torch.backends.cuda.matmul.allow_tf32 = True
 
 class InferenceController:
-    def __init__(self, trained_run_id, db_manager, callback=None):
-        self.trained_run_id = trained_run_id
-        self.db = db_manager
+    def __init__(self, model_run_path, dataset_name, output_filename, callback=None, is_test_run=False, test_run_percentage=0.3):
+        self.model_run_path = Path(model_run_path)
+        self.dataset_name = dataset_name
+        self.output_filename = output_filename
+        
+        self.hp = get_hyperparameters(dataset_name)
+        
+        self.encoder_path_str = str(MODELS_DIR / DEFAULT_ENCODER_MODEL.split('/')[-1])
+        
         self.callback = callback or (lambda *args: 'CONTINUE')
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.run_id = None
-        self.trained_model_report_dir = REPORTS_DIR / str(self.trained_run_id)
-        self.ft_path = self.trained_model_report_dir / 'final_model'
+        self.is_test_run = is_test_run
+        self.test_run_percentage = test_run_percentage
+        self.is_gui_mode = callback is not None
         
-        run_details = self.db.get_run_details(self.trained_run_id)
-        if not run_details:
-            raise FileNotFoundError(f"Could not find details for run ID '{self.trained_run_id}'")
-        
-        self.model_name = run_details['run_info'].get('model_name')
-        self.hyperparameters = run_details.get('hyperparameters', {})
-        
-        if not self.ft_path.exists() or not self.model_name:
-            raise FileNotFoundError(f"Fine-tuned model not found for run '{self.trained_run_id}' in {self.ft_path}")
+        self.model = None
 
     def _log(self, message):
         print(message)
         if self.callback: self.callback({"log": message})
+
+    def _cleanup(self, model_to_clean=None):
+        target = model_to_clean if model_to_clean else self.model
+        if target:
+            del target
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     def _mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output[0]
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
-    def _prepare_inference_data(self, input_file_path):
-        self._log("Preparing inference data...")
+    def _load_and_embed_dataset(self, dataset_path, encoder_model, encoder_tokenizer):
+        self._log(f"Loading and embedding {dataset_path.name}...")
         
-        encoder_path_str = str(DEFAULT_BERT_PATH)
-        encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_path_str, local_files_only=True)
-        encoder_model = AutoModel.from_pretrained(encoder_path_str, local_files_only=True).to(self.device).eval()
-
         all_embeddings = []
         all_labels = []
         
-        is_gui_mode = self.callback != InferenceController.__init__.__defaults__[0]
-
-        with pd.read_csv(input_file_path, chunksize=100000) as reader:
-            pbar = tqdm(reader, desc="Generating Embeddings", disable=is_gui_mode, unit=" chunks")
+        try:
+            total_chunks = sum(1 for _ in pd.read_csv(dataset_path, chunksize=100000))
+        except Exception as e:
+            self._log(f"Could not read dataset {dataset_path}: {e}")
+            return None
+            
+        with pd.read_csv(dataset_path, chunksize=100000) as reader:
+            pbar = tqdm(reader, desc=f"Embedding {dataset_path.name}", disable=self.is_gui_mode, unit=" chunks", total=total_chunks)
             for i, chunk_df in enumerate(pbar):
-                chunk_df['Processed_Content'] = chunk_df['Content'].apply(replace_patterns)
-                sequences = [content.split(' ;-; ') for content in chunk_df['Processed_Content'].values]
-                labels = chunk_df['Label'].fillna(-1).astype(int).values if 'Label' in chunk_df.columns else np.full(len(sequences), -1, dtype=int)
+                if self.is_test_run:
+                    chunk_df = chunk_df.sample(frac=self.test_run_percentage, random_state=42)
+
+                source_dataset = LogDataset(dataframe=chunk_df)
+                sequences_in_chunk = source_dataset.sequences
+                labels_in_chunk = source_dataset.get_all_labels()
                 
                 sequence_batch_size = 256
-                for j in range(0, len(sequences), sequence_batch_size):
-                    batch_of_sequences = sequences[j:j+sequence_batch_size]
+                for j in range(0, len(sequences_in_chunk), sequence_batch_size):
+                    batch_of_sequences = sequences_in_chunk[j:j+sequence_batch_size]
                     if not batch_of_sequences or not any(batch_of_sequences): continue
                     
                     all_logs_flat, start_positions = merge_data(batch_of_sequences)
                     if not all_logs_flat: continue
 
                     with torch.no_grad():
-                        inputs = encoder_tokenizer(all_logs_flat, return_tensors="pt", padding=True, truncation=True, max_length=self.hyperparameters['max_content_len']).to(self.device)
+                        inputs = encoder_tokenizer(all_logs_flat, return_tensors="pt", padding=True, truncation=True, max_length=self.hp['max_content_len']).to(self.device)
                         model_output = encoder_model(**inputs)
                         line_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
-
+                    
                     sequence_tensors = list(torch.tensor_split(line_embeddings.cpu(), start_positions[1:]))
                     all_embeddings.extend(sequence_tensors)
 
-                all_labels.extend(labels)
-                if is_gui_mode:
-                    progress = min((i + 1) / pbar.total, 1.0) if pbar.total and pbar.total > 0 else 0
-                    self.callback({"embedding_status": f"Processing data chunk {i+1}/{pbar.total}", "embedding_progress": progress})
-        
-        del encoder_model, encoder_tokenizer
-        gc.collect()
-        torch.cuda.empty_cache()
+                all_labels.extend(labels_in_chunk)
+                
+                if self.is_gui_mode:
+                    progress = min((i + 1) / total_chunks, 1.0)
+                    self.callback({"status": f"Embedding {dataset_path.name}: Chunk {i+1}/{total_chunks}"})
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as tmp:
-            torch.save({'embeddings': all_embeddings, 'labels': torch.tensor(all_labels)}, tmp.name)
-            tmp_path = Path(tmp.name)
+        self._log("Embedding complete. Tensorizing sequences...")
         
-        tensorize_dataset(tmp_path, self.hyperparameters['max_seq_len'])
-        
-        tensorized_path = tmp_path.with_suffix('.tensor.pt')
-        if tensorized_path.exists():
-            data = torch.load(tensorized_path)
-            tmp_path.unlink()
-            tensorized_path.unlink()
-            return TensorDataset(data['sequences'], data['labels'])
-        else:
-            raise RuntimeError("Failed to tensorize inference dataset.")
+        tensorized_sequences = []
+        tensorized_labels = []
+        max_seq_len = self.hp['max_seq_len']
+        sample_embedding_dim = all_embeddings[0].shape[1]
 
-    def run(self, input_file_path: str, mode: str, internal_batch_size: int = 32):
-        from utils.resource_monitor import ResourceMonitor
-        from utils.log_visualizer import LogVisualizer
-        from engine.phase_manager import evaluate_and_visualize
+        for i in tqdm(range(len(all_embeddings)), desc="Tensorizing sequences", disable=self.is_gui_mode):
+            seq_embeddings = all_embeddings[i]
+            seq_label = all_labels[i]
+            
+            if seq_embeddings is None or seq_embeddings.shape[0] == 0:
+                continue
+                
+            seq_len = seq_embeddings.shape[0]
 
-        self.run_start_time = time.time()
-        run_type = 'Testing' if mode == 'testing' else 'Inference'
+            if seq_len > max_seq_len:
+                tensorized_seq = seq_embeddings[-max_seq_len:]
+            elif seq_len < max_seq_len:
+                padding_len = max_seq_len - seq_len
+                padding = torch.zeros(padding_len, sample_embedding_dim, dtype=torch.float32)
+                tensorized_seq = torch.cat([seq_embeddings, padding], dim=0)
+            else:
+                tensorized_seq = seq_embeddings
+                
+            tensorized_sequences.append(tensorized_seq)
+            tensorized_labels.append(torch.tensor(seq_label, dtype=torch.long))
+
+        if not tensorized_sequences:
+            raise RuntimeError(f"No sequences were tensorized for {dataset_path.name}.")
+
+        sequences_tensor = torch.stack(tensorized_sequences).to(self.device)
+        labels_tensor = torch.stack(tensorized_labels).to(self.device)
         
-        self.run_id = self.db.create_new_run(run_type, f"run_{self.trained_run_id}", os.path.basename(input_file_path), {"mode": mode, "batch_size": internal_batch_size})
-        if not self.run_id: raise RuntimeError("Failed to create new run in the database.")
-        
-        report_dir = REPORTS_DIR / str(self.run_id)
-        report_dir.mkdir(exist_ok=True)
-        self.visualizer = LogVisualizer(plot_dir=report_dir)
-        monitor = ResourceMonitor()
-        monitor.start()
-        
-        final_status, results = 'FAILED', None
+        self._log(f"Created TensorDataset for {dataset_path.name} with {len(labels_tensor)} samples.")
+        return TensorDataset(sequences_tensor, labels_tensor)
+            
+    def run_inference(self):
+        start_time = time.time()
         try:
-            dataset = self._prepare_inference_data(input_file_path)
-            
-            model = LogSentinelModel(self.model_name, self.hyperparameters['encoder_hidden_size'], self.hyperparameters, self.ft_path, False, self.device)
-            if platform.system() == "Linux": model = torch.compile(model)
-            
-            if mode == 'testing':
-                if (dataset.tensors[1] == -1).all():
-                    raise ValueError("Testing mode requires a 'Label' column with valid labels.")
-                perf_metrics = evaluate_and_visualize(self, dataset, "test")
-            else: 
-                all_probas = []
-                loader = DataLoader(dataset, batch_size=internal_batch_size)
-                with torch.no_grad():
-                    for sequences, _ in tqdm(loader, desc="Inference"):
-                        sequences = sequences.to(self.device)
-                        logits, _ = model.get_logits(sequence_tensor_batch=sequences)
-                        probas = torch.softmax(logits, dim=-1)
-                        all_probas.extend(probas[:, 1].cpu().numpy())
-                
-                df = pd.read_csv(input_file_path)
-                df['Prediction'] = ["Anomalous" if p > 0.5 else "Normal" for p in all_probas]
-                df['Confidence'] = all_probas
-                
-                output_csv_path = report_dir / f"inference_results_{self.run_id}.csv"
-                df.to_csv(output_csv_path, index=False)
-                results = str(output_csv_path)
-                perf_metrics = {}
+            self._log(f"Loading base encoder: {self.encoder_path_str}")
+            encoder_config = AutoConfig.from_pretrained(self.encoder_path_str)
+            encoder_tokenizer = AutoTokenizer.from_pretrained(self.encoder_path_str)
+            encoder_model = AutoModel.from_pretrained(self.encoder_path_str).to(self.device).eval()
 
-            total_run_time = time.time() - self.run_start_time
-            time_per_record_ms = (total_run_time / len(dataset)) * 1000 if len(dataset) > 0 else 0
+            self._log("Preparing dataset for inference...")
+            dataset_path = Path("datasets") / self.dataset_name / 'test.csv'
             
-            perf_metrics.setdefault('overall', {}).update({
-                "total_run_time_sec": total_run_time,
-                "time_per_record_ms": time_per_record_ms
+            dataset = self._load_and_embed_dataset(dataset_path, encoder_model, encoder_tokenizer)
+            self._cleanup(model_to_clean=encoder_model)
+            del encoder_tokenizer
+            
+            if not dataset:
+                raise RuntimeError("Inference dataset could not be loaded.")
+
+            self._log(f"Loading fine-tuned model from: {self.model_run_path}")
+            
+            ft_model_path = self.model_run_path / 'output_model'
+            if not ft_model_path.exists():
+                raise FileNotFoundError(f"Fine-tuned model not found at {ft_model_path}")
+
+            self.model = LogSentinelModel(
+                llama_model_path=str(MODELS_DIR / DEFAULT_LLAMA_MODEL.split('/')[-1]),
+                encoder_hidden_size=encoder_config.hidden_size,
+                hyperparameters=self.hp,
+                ft_path=str(ft_model_path),
+                is_train_mode=False,
+                device=self.device,
+                log_callback=self._log
+            )
+            self.model = torch.compile(self.model, mode="max-autotune")
+            self.model.eval()
+
+            loader = DataLoader(
+                dataset,
+                batch_size=self.hp['micro_batch_size'] * 2,
+                num_workers=self.num_workers,
+                pin_memory=True
+            )
+            
+            all_preds = []
+            all_probs = []
+            
+            with torch.no_grad():
+                for sequences, _ in tqdm(loader, desc="Running inference", disable=self.is_gui_mode):
+                    sequences = sequences.to(self.device, non_blocking=True)
+                    logits, _ = self.model.get_logits(sequences)
+                    
+                    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                    preds = (probs > 0.5).astype(int)
+                    
+                    all_preds.extend(preds)
+                    all_probs.extend(probs)
+            
+            output_df = pd.DataFrame({
+                'prediction': all_preds,
+                'anomaly_probability': all_probs
             })
             
-            self.db.save_performance_metrics(self.run_id, perf_metrics)
-            final_status = 'COMPLETED'
+            output_path = self.model_run_path / self.output_filename
+            output_df.to_csv(output_path, index=False)
+            
+            total_time = time.time() - start_time
+            self._log(f"Inference complete in {format_time(total_time)}.")
+            self._log(f"Predictions saved to: {output_path}")
+
         except Exception as e:
             tb_str = traceback.format_exc()
-            error_msg = f"CRITICAL ERROR in run {self.run_id}: {e}\n{tb_str}"
+            error_msg = f"CRITICAL ERROR in inference: {e}\n{tb_str}"
             self._log(error_msg)
             if self.callback: self.callback({"error": f"{e}\n{tb_str}"})
-            final_status = 'FAILED'
         finally:
-            resource_metrics = monitor.stop()
-            if self.run_id:
-                self.db.save_resource_metrics(self.run_id, resource_metrics)
-                if self.visualizer: self.visualizer.plot_resource_usage(resource_metrics)
-                self.db.update_run_status(self.run_id, final_status, str(report_dir) if final_status == 'COMPLETED' else None)
-            
-            if self.callback: self.callback({"status": final_status, "done": True, "result": results})
+            self._cleanup(self.model)
