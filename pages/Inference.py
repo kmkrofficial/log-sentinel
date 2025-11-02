@@ -6,6 +6,8 @@ import threading
 import queue
 import time
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from engine.inference_controller import InferenceController
@@ -28,31 +30,28 @@ state = GlobalState.get_instance()
 def get_trained_model_options():
     if not EXECUTIONS_DIR.exists():
         return []
-    
+
     options = []
     for d in EXECUTIONS_DIR.iterdir():
         if d.is_dir() and (d / 'output_model').exists():
             try:
-                run_id_str = d.name.split('_')[0]
-                if run_id_str.isdigit():
-                    run_id = int(run_id_str)
-                    details = db.get_run_details(run_id)
-                    if details:
-                        options.append((details['nickname'], d))
-                    else:
-                        options.append((d.name, d))
+                # Attempt to find run details from nickname for a friendlier name
+                details = db.get_runs_by_nickname_prefix(d.name)
+                if details:
+                     # Use the first match if found
+                    options.append((details[0], d))
                 else:
                     options.append((d.name, d))
             except Exception:
                 options.append((d.name, d))
-    
+
     options.sort(key=lambda x: x[0], reverse=True)
     return options
 
 def start_inference_thread(model_path, dataset_name, output_filename, is_test_run, test_run_pct):
     q = queue.Queue()
-    state.set_train_state(True, q) 
-    
+    state.set_train_state(True, q)
+
     def run():
         try:
             controller = InferenceController(
@@ -81,30 +80,30 @@ with col1:
     if not model_options:
         st.error(f"No trained models found in `{EXECUTIONS_DIR}`. Please train a model first.")
         st.stop()
-    
+
     selected_model_name = st.selectbox(
         "Select Trained Model",
         options=[name for name, path in model_options],
         index=0,
         help="Select a previously trained model from an execution run."
     )
-    
+
     model_path = dict(model_options)[selected_model_name]
 
     dataset_options = get_dataset_options(DATA_DIR)
     if not dataset_options:
         st.error(f"No datasets found in `{DATA_DIR}`. Please add datasets to continue.")
         st.stop()
-        
+
     dataset_name = st.selectbox(
         "Select Dataset for Inference",
         options=dataset_options,
         index=0,
         help="Select the dataset to run inference on. This should be a test set."
     )
-    
+
     output_filename = st.text_input(
-        "Output Filename", 
+        "Output Filename",
         value=f"predictions_{selected_model_name}_{dataset_name}.csv",
         help="The name of the CSV file to save predictions to. It will be saved in the model's execution directory."
     )
@@ -113,11 +112,11 @@ with col1:
     is_test_run = st.checkbox("Run a quick test on a fraction of data", value=False)
     test_run_percentage = st.slider("Test Run Data Fraction", min_value=0.01, max_value=1.0, value=0.1, step=0.01, disabled=not is_test_run)
 
-    if st.button("🚀 Start Inference", type="primary", disabled=state.is_training, use_container_width=True):
+    if st.button("🚀 Start Inference", type="primary", disabled=state.is_training):
         if dataset_name and selected_model_name and output_filename:
             st.session_state.log_messages = []
             st.session_state.status = "Starting..."
-            
+
             start_inference_thread(
                 model_path,
                 dataset_name,
@@ -130,7 +129,7 @@ with col1:
 
 with col2:
     st.header("Inference Status")
-    
+
     if state.is_training and state.queue:
         while state.queue and not state.queue.empty():
             msg = state.queue.get()
@@ -152,7 +151,7 @@ with col2:
 
     status_placeholder.text(st.session_state.get('status', 'Idle'))
     render_logs(log_placeholder)
-    
+
     if state.is_training:
         time.sleep(1)
         st.rerun()

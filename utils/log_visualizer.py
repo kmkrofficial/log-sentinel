@@ -15,28 +15,24 @@ class LogVisualizer:
         fig.savefig(path)
         plt.close(fig)
 
-    def plot_resource_usage(self, metrics_history):
+    def plot_resource_usage(self, resource_df):
         try:
-            df = pd.DataFrame(metrics_history)
-            
             fig, ax1 = plt.subplots(figsize=(12, 6))
             ax1.set_xlabel('Time (measurement point)')
             ax1.set_ylabel('RAM Usage (GB)', color='tab:blue')
-            ax1.plot(df.index, df['ram_used_gb'], color='tab:blue', label='RAM Used (GB)')
+            ax1.plot(resource_df.index, resource_df['ram_usage_gb'], color='tab:blue', label='RAM Used (GB)')
             ax1.tick_params(axis='y', labelcolor='tab:blue')
-            ax1.set_title('RAM Usage Over Time')
+            ax1.set_title('RAM and VRAM Usage Over Time')
             fig.tight_layout()
-            self._save_plot(fig, "ram_usage_over_time")
 
-            if 'gpu_vram_used_gb' in df.columns:
-                fig, ax2 = plt.subplots(figsize=(12, 6))
-                ax2.set_xlabel('Time (measurement point)')
+            if 'gpu_vram_used_gb' in resource_df.columns:
+                ax2 = ax1.twinx()
                 ax2.set_ylabel('VRAM Usage (GB)', color='tab:red')
-                ax2.plot(df.index, df['gpu_vram_used_gb'], color='tab:red', label='VRAM Used (GB)')
+                ax2.plot(resource_df.index, resource_df['gpu_vram_used_gb'], color='tab:red', label='VRAM Used (GB)')
                 ax2.tick_params(axis='y', labelcolor='tab:red')
-                ax2.set_title('GPU VRAM Usage Over Time')
-                fig.tight_layout()
-                self._save_plot(fig, "vram_usage_over_time")
+
+            fig.tight_layout()
+            self._save_plot(fig, "resource_usage_over_time")
 
         except Exception as e:
             print(f"Error plotting resource usage: {e}")

@@ -39,8 +39,19 @@ class LogSentinelModel(nn.Module):
             ['Below is a sequence of system log messages:'],
             return_tensors="pt", padding=True
         ).to(projector_device)
-        
+
         self._setup_peft(ft_path, is_train_mode)
+
+        if ft_path:
+            projector_path = os.path.join(ft_path, 'projector.pt')
+            classifier_path = os.path.join(ft_path, 'classifier.pt')
+            if os.path.exists(projector_path):
+                self._log(f"Loading projector weights from {projector_path}")
+                self.projector.load_state_dict(torch.load(projector_path, map_location=projector_device))
+            if os.path.exists(classifier_path):
+                self._log(f"Loading classifier weights from {classifier_path}")
+                self.classifier.load_state_dict(torch.load(classifier_path, map_location=projector_device))
+
 
     def _setup_peft(self, ft_path, is_train_mode):
         try:
@@ -50,7 +61,7 @@ class LogSentinelModel(nn.Module):
             elif is_train_mode:
                 self._log("No adapter found. Creating new PEFT configuration for training.")
                 self.llama_model = prepare_model_for_kbit_training(self.llama_model, use_gradient_checkpointing=False)
-                
+
                 lora_rank = self.hp.get('lora_r', 64)
                 self._log(f"Using LoRA rank (r): {lora_rank}")
                 lora_config = LoraConfig(r=lora_rank, lora_alpha=lora_rank, lora_dropout=0.1, target_modules=["q_proj", "v_proj"], bias="none", task_type=TaskType.CAUSAL_LM)
@@ -75,7 +86,7 @@ class LogSentinelModel(nn.Module):
             is_lora = 'lora_' in name
             is_projector = 'projector' in name
             is_classifier = 'classifier' in name
-            
+
             if (is_lora and kwargs.get('llama_lora')) or \
                (is_projector and kwargs.get('projector')) or \
                (is_classifier and kwargs.get('classifier')):
@@ -85,28 +96,29 @@ class LogSentinelModel(nn.Module):
 
     def set_train_projector_and_classifier(self): self.set_trainable(projector=True, classifier=True)
     def set_finetuning_all(self): self.set_trainable(projector=True, classifier=True, llama_lora=True)
-    
+
     def get_logits(self, sequence_tensor_batch):
         batch_size = sequence_tensor_batch.shape[0]
-        
-        projected_batch = self.projector(sequence_tensor_batch)
-        
+
+        projector_dtype = next(self.projector.parameters()).dtype
+        projected_batch = self.projector(sequence_tensor_batch.to(projector_dtype))
+
         embed_layer = self.llama_model.get_input_embeddings()
         instruc_embeds = embed_layer(self.instruc_tokens['input_ids']).expand(batch_size, -1, -1)
-        
+
         inputs_embeds = torch.cat([instruc_embeds, projected_batch], dim=1)
-        
+
         attention_mask = torch.ones(inputs_embeds.shape[:2], device=self.device, dtype=torch.long)
-        
+
         outputs = self.llama_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
-        
+
         last_hidden_state = outputs.hidden_states[-1]
-        
+
         sequence_lengths = attention_mask.sum(dim=1) - 1
         batch_indices = torch.arange(batch_size, device=last_hidden_state.device)
         cls_input_hidden_state = last_hidden_state[batch_indices, sequence_lengths]
-        
+
         classifier_dtype = next(self.classifier.parameters()).dtype
         logits = self.classifier(cls_input_hidden_state.to(classifier_dtype))
-        
+
         return logits, batch_indices

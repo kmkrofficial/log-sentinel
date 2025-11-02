@@ -21,7 +21,8 @@ DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B"
 def get_optimal_workers():
     try:
         cpu_count = psutil.cpu_count(logical=True)
-        return max(4, min(cpu_count, 16))
+        # Use half of the available cores, up to a reasonable limit
+        return max(4, min(cpu_count // 2, 16))
     except Exception:
         return 4
 

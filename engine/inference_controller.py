@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, AutoModel, AutoConfig
 from torch.utils.data import TensorDataset, DataLoader
 
 from config import (
-    EXECUTIONS_DIR, MODELS_DIR, DEFAULT_ENCODER_MODEL, 
+    EXECUTIONS_DIR, MODELS_DIR, DEFAULT_ENCODER_MODEL,
     DEFAULT_LLAMA_MODEL, get_hyperparameters
 )
 from utils.database_manager import DatabaseManager
@@ -31,17 +31,18 @@ class InferenceController:
         self.model_run_path = Path(model_run_path)
         self.dataset_name = dataset_name
         self.output_filename = output_filename
-        
+
         self.hp = get_hyperparameters(dataset_name)
-        
+
         self.encoder_path_str = str(MODELS_DIR / DEFAULT_ENCODER_MODEL.split('/')[-1])
-        
+
         self.callback = callback or (lambda *args: 'CONTINUE')
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.is_test_run = is_test_run
         self.test_run_percentage = test_run_percentage
         self.is_gui_mode = callback is not None
-        
+        self.num_workers = self.hp.get('dataloader_num_workers', 0)
+
         self.model = None
 
     def _log(self, message):
@@ -60,18 +61,18 @@ class InferenceController:
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
-    def _load_and_embed_dataset(self, dataset_path, encoder_model, encoder_tokenizer):
+    def _load_and_tensorize_dataset(self, dataset_path, encoder_model, encoder_tokenizer):
         self._log(f"Loading and embedding {dataset_path.name}...")
-        
+
         all_embeddings = []
         all_labels = []
-        
+
         try:
             total_chunks = sum(1 for _ in pd.read_csv(dataset_path, chunksize=100000))
         except Exception as e:
             self._log(f"Could not read dataset {dataset_path}: {e}")
             return None
-            
+
         with pd.read_csv(dataset_path, chunksize=100000) as reader:
             pbar = tqdm(reader, desc=f"Embedding {dataset_path.name}", disable=self.is_gui_mode, unit=" chunks", total=total_chunks)
             for i, chunk_df in enumerate(pbar):
@@ -81,43 +82,68 @@ class InferenceController:
                 source_dataset = LogDataset(dataframe=chunk_df)
                 sequences_in_chunk = source_dataset.sequences
                 labels_in_chunk = source_dataset.get_all_labels()
-                
-                sequence_batch_size = 256
-                for j in range(0, len(sequences_in_chunk), sequence_batch_size):
-                    batch_of_sequences = sequences_in_chunk[j:j+sequence_batch_size]
-                    if not batch_of_sequences or not any(batch_of_sequences): continue
-                    
-                    all_logs_flat, start_positions = merge_data(batch_of_sequences)
-                    if not all_logs_flat: continue
+
+                all_logs_flat, start_positions = merge_data(sequences_in_chunk)
+
+                if not all_logs_flat:
+                    all_embeddings.extend([torch.empty(0)] * len(labels_in_chunk))
+                    all_labels.extend(labels_in_chunk)
+                    continue
+
+                log_message_batch_size = 512
+                all_line_embeddings = []
+
+                for k in range(0, len(all_logs_flat), log_message_batch_size):
+                    log_batch = all_logs_flat[k : k + log_message_batch_size]
 
                     with torch.no_grad():
-                        inputs = encoder_tokenizer(all_logs_flat, return_tensors="pt", padding=True, truncation=True, max_length=self.hp['max_content_len']).to(self.device)
+                        inputs = encoder_tokenizer(log_batch, return_tensors="pt", padding=True, truncation=True, max_length=self.hp['max_content_len']).to(self.device)
                         model_output = encoder_model(**inputs)
                         line_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
-                    
-                    sequence_tensors = list(torch.tensor_split(line_embeddings.cpu(), start_positions[1:]))
-                    all_embeddings.extend(sequence_tensors)
+                        all_line_embeddings.append(line_embeddings.cpu())
 
+                if not all_line_embeddings:
+                    all_embeddings.extend([torch.empty(0)] * len(labels_in_chunk))
+                    all_labels.extend(labels_in_chunk)
+                    continue
+
+                all_line_embeddings_tensor = torch.cat(all_line_embeddings, dim=0)
+                sequence_tensors = list(torch.tensor_split(all_line_embeddings_tensor, start_positions[1:-1]))
+
+                all_embeddings.extend(sequence_tensors)
                 all_labels.extend(labels_in_chunk)
-                
+
                 if self.is_gui_mode:
                     progress = min((i + 1) / total_chunks, 1.0)
                     self.callback({"status": f"Embedding {dataset_path.name}: Chunk {i+1}/{total_chunks}"})
 
         self._log("Embedding complete. Tensorizing sequences...")
-        
+
         tensorized_sequences = []
         tensorized_labels = []
         max_seq_len = self.hp['max_seq_len']
-        sample_embedding_dim = all_embeddings[0].shape[1]
+
+        if not all_embeddings:
+             raise RuntimeError(f"No log sequences found after processing {dataset_path.name}.")
+
+
+        first_valid_tensor = next((t for t in all_embeddings if t.shape[0] > 0), None)
+        if first_valid_tensor is None:
+            raise RuntimeError(f"All log sequences are empty in {dataset_path.name}.")
+        sample_embedding_dim = first_valid_tensor.shape[1]
+
 
         for i in tqdm(range(len(all_embeddings)), desc="Tensorizing sequences", disable=self.is_gui_mode):
             seq_embeddings = all_embeddings[i]
             seq_label = all_labels[i]
-            
+
             if seq_embeddings is None or seq_embeddings.shape[0] == 0:
+                padding_len = max_seq_len
+                padding = torch.zeros(padding_len, sample_embedding_dim, dtype=torch.float32)
+                tensorized_sequences.append(padding)
+                tensorized_labels.append(torch.tensor(seq_label, dtype=torch.long))
                 continue
-                
+
             seq_len = seq_embeddings.shape[0]
 
             if seq_len > max_seq_len:
@@ -128,19 +154,19 @@ class InferenceController:
                 tensorized_seq = torch.cat([seq_embeddings, padding], dim=0)
             else:
                 tensorized_seq = seq_embeddings
-                
+
             tensorized_sequences.append(tensorized_seq)
             tensorized_labels.append(torch.tensor(seq_label, dtype=torch.long))
 
         if not tensorized_sequences:
             raise RuntimeError(f"No sequences were tensorized for {dataset_path.name}.")
 
-        sequences_tensor = torch.stack(tensorized_sequences).to(self.device)
-        labels_tensor = torch.stack(tensorized_labels).to(self.device)
-        
+        sequences_tensor = torch.stack(tensorized_sequences)
+        labels_tensor = torch.stack(tensorized_labels)
+
         self._log(f"Created TensorDataset for {dataset_path.name} with {len(labels_tensor)} samples.")
         return TensorDataset(sequences_tensor, labels_tensor)
-            
+
     def run_inference(self):
         start_time = time.time()
         try:
@@ -151,16 +177,16 @@ class InferenceController:
 
             self._log("Preparing dataset for inference...")
             dataset_path = Path("datasets") / self.dataset_name / 'test.csv'
-            
-            dataset = self._load_and_embed_dataset(dataset_path, encoder_model, encoder_tokenizer)
+
+            dataset = self._load_and_tensorize_dataset(dataset_path, encoder_model, encoder_tokenizer)
             self._cleanup(model_to_clean=encoder_model)
             del encoder_tokenizer
-            
+
             if not dataset:
                 raise RuntimeError("Inference dataset could not be loaded.")
 
             self._log(f"Loading fine-tuned model from: {self.model_run_path}")
-            
+
             ft_model_path = self.model_run_path / 'output_model'
             if not ft_model_path.exists():
                 raise FileNotFoundError(f"Fine-tuned model not found at {ft_model_path}")
@@ -183,29 +209,29 @@ class InferenceController:
                 num_workers=self.num_workers,
                 pin_memory=True
             )
-            
+
             all_preds = []
             all_probs = []
-            
+
             with torch.no_grad():
                 for sequences, _ in tqdm(loader, desc="Running inference", disable=self.is_gui_mode):
                     sequences = sequences.to(self.device, non_blocking=True)
                     logits, _ = self.model.get_logits(sequences)
-                    
-                    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+
+                    probs = torch.softmax(logits, dim=1)[:, 1].float().cpu().numpy()
                     preds = (probs > 0.5).astype(int)
-                    
+
                     all_preds.extend(preds)
                     all_probs.extend(probs)
-            
+
             output_df = pd.DataFrame({
                 'prediction': all_preds,
                 'anomaly_probability': all_probs
             })
-            
+
             output_path = self.model_run_path / self.output_filename
             output_df.to_csv(output_path, index=False)
-            
+
             total_time = time.time() - start_time
             self._log(f"Inference complete in {format_time(total_time)}.")
             self._log(f"Predictions saved to: {output_path}")

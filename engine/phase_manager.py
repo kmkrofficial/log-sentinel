@@ -105,7 +105,12 @@ def train_phase(controller: 'TrainingController', phase_name, num_epochs, learni
             controller._log("Running validation...")
             val_metrics, _ = evaluate(controller, validation_dataset, "validation", epoch)
             
-            current_metric = val_metrics[f'val_{metric_key}']
+            current_metric_key = f'validation_{metric_key}'
+            if current_metric_key not in val_metrics:
+                controller._log(f"Warning: Metric key '{current_metric_key}' not found in validation metrics. Available: {val_metrics.keys()}")
+                continue
+                
+            current_metric = val_metrics[current_metric_key]
             
             if current_metric > best_metric + min_delta:
                 best_metric = current_metric
@@ -203,7 +208,7 @@ def evaluate_and_visualize(controller: 'TrainingController', dataset, dataset_na
                 for sequences, labels in tqdm(loader, desc=f"Generating plots for {dataset_name}", disable=True):
                     sequences = sequences.to(controller.device, non_blocking=True)
                     logits, _ = controller.model.get_logits(sequences)
-                    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                    probs = torch.softmax(logits, dim=1)[:, 1].float().cpu().numpy()
                     all_probs.extend(probs)
                     all_labels.extend(labels.cpu().numpy())
 
