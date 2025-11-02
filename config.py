@@ -48,8 +48,9 @@ DATASET_HYPERPARAMETERS = {
         "max_seq_len": 100,
     },
     "Liberty": {
-        "min_less_portion": 0.3,
+        "min_less_portion": 0.5,
         "max_seq_len": 100,
+        "lr_phase_full": 8e-6
     },
     "HDFS": {
         "min_less_portion": 0.3,

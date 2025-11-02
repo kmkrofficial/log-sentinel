@@ -10,7 +10,7 @@ import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, random_split
 from datetime import datetime
 
 from config import (
@@ -94,20 +94,14 @@ class TrainingController:
         all_embeddings = []
         all_labels = []
 
-        is_gui_mode = self.is_gui_mode
-
         try:
             total_chunks = sum(1 for _ in pd.read_csv(dataset_path, chunksize=100000))
         except Exception as e:
             self._log(f"Could not read dataset {dataset_path}: {e}")
             return None
 
-        progress_state['phase_total_steps'] = total_chunks
-        progress_state['phase_steps'] = 0
-        progress_state['phase_start_time'] = time.time()
-
         with pd.read_csv(dataset_path, chunksize=100000) as reader:
-            pbar = tqdm(reader, desc=f"Embedding {dataset_path.name}", disable=is_gui_mode, unit=" chunks", total=total_chunks)
+            pbar = tqdm(reader, desc=f"Embedding {dataset_path.name}", disable=self.is_gui_mode, unit=" chunks", total=total_chunks)
             for i, chunk_df in enumerate(pbar):
                 if self.is_test_run:
                     chunk_df = chunk_df.sample(frac=self.test_run_percentage, random_state=42)
@@ -115,7 +109,6 @@ class TrainingController:
                 source_dataset = LogDataset(dataframe=chunk_df)
                 sequences_in_chunk = source_dataset.sequences
                 labels_in_chunk = source_dataset.get_all_labels()
-
                 all_logs_flat, start_positions = merge_data(sequences_in_chunk)
 
                 if not all_logs_flat:
@@ -125,10 +118,14 @@ class TrainingController:
 
                 log_message_batch_size = 512
                 all_line_embeddings = []
+                num_log_batches = (len(all_logs_flat) + log_message_batch_size - 1) // log_message_batch_size
 
-                for k in range(0, len(all_logs_flat), log_message_batch_size):
-                    log_batch = all_logs_flat[k : k + log_message_batch_size]
+                for k, batch_start in enumerate(range(0, len(all_logs_flat), log_message_batch_size)):
+                    if self.is_gui_mode and k % 20 == 0:
+                        status_msg = f"Embedding {dataset_path.name} [Chunk {i+1}/{total_chunks}]: Processing log batch {k+1}/{num_log_batches}"
+                        self.callback({"status": status_msg})
 
+                    log_batch = all_logs_flat[batch_start : batch_start + log_message_batch_size]
                     with torch.no_grad():
                         inputs = encoder_tokenizer(log_batch, return_tensors="pt", padding=True, truncation=True, max_length=self.hp['max_content_len']).to(self.device)
                         model_output = encoder_model(**inputs)
@@ -142,82 +139,60 @@ class TrainingController:
 
                 all_line_embeddings_tensor = torch.cat(all_line_embeddings, dim=0)
                 sequence_tensors = list(torch.tensor_split(all_line_embeddings_tensor, start_positions[1:-1]))
-
                 all_embeddings.extend(sequence_tensors)
                 all_labels.extend(labels_in_chunk)
 
-                progress_state['phase_steps'] += 1
-                progress_state['global_step'] += 1
-
-                if is_gui_mode:
-                    progress = min((i + 1) / total_chunks, 1.0)
-                    eta_str = get_eta(progress_state['phase_start_time'], progress_state['phase_steps'], progress_state['phase_total_steps'])
-                    self.callback({
-                        "progress": progress,
-                        "status": f"Embedding {dataset_path.name}: Chunk {i+1}/{total_chunks} - ETA: {eta_str}"
-                    })
-
         self._log("Embedding complete. Tensorizing sequences...")
-
-        tensorized_sequences = []
-        tensorized_labels = []
+        
+        tensorized_sequences, tensorized_labels = [], []
         max_seq_len = self.hp['max_seq_len']
-
+        
         if not all_embeddings:
              raise RuntimeError(f"No log sequences found after processing {dataset_path.name}.")
-
-
+        
         first_valid_tensor = next((t for t in all_embeddings if t.shape[0] > 0), None)
         if first_valid_tensor is None:
             raise RuntimeError(f"All log sequences are empty in {dataset_path.name}.")
         sample_embedding_dim = first_valid_tensor.shape[1]
 
-
-        for i in tqdm(range(len(all_embeddings)), desc="Tensorizing sequences", disable=is_gui_mode):
-            seq_embeddings = all_embeddings[i]
-            seq_label = all_labels[i]
-
+        num_sequences = len(all_embeddings)
+        for i in range(num_sequences):
+            if self.is_gui_mode and i % 5000 == 0:
+                status_msg = f"Tensorizing {dataset_path.name}: Processing sequence {i}/{num_sequences}"
+                self.callback({"status": status_msg})
+            
+            seq_embeddings, seq_label = all_embeddings[i], all_labels[i]
+            
             if seq_embeddings is None or seq_embeddings.shape[0] == 0:
-                padding_len = max_seq_len
-                padding = torch.zeros(padding_len, sample_embedding_dim, dtype=torch.float32)
+                padding = torch.zeros(max_seq_len, sample_embedding_dim, dtype=torch.float32)
                 tensorized_sequences.append(padding)
                 tensorized_labels.append(torch.tensor(seq_label, dtype=torch.long))
                 continue
-
+                
             seq_len = seq_embeddings.shape[0]
-
             if seq_len > max_seq_len:
                 tensorized_seq = seq_embeddings[-max_seq_len:]
             elif seq_len < max_seq_len:
-                padding_len = max_seq_len - seq_len
-                padding = torch.zeros(padding_len, sample_embedding_dim, dtype=torch.float32)
+                padding = torch.zeros(max_seq_len - seq_len, sample_embedding_dim, dtype=torch.float32)
                 tensorized_seq = torch.cat([seq_embeddings, padding], dim=0)
             else:
                 tensorized_seq = seq_embeddings
-
+                
             tensorized_sequences.append(tensorized_seq)
             tensorized_labels.append(torch.tensor(seq_label, dtype=torch.long))
 
         if not tensorized_sequences:
             raise RuntimeError(f"No sequences were tensorized for {dataset_path.name}.")
 
-        sequences_tensor = torch.stack(tensorized_sequences)
-        labels_tensor = torch.stack(tensorized_labels)
-
-        self._log(f"Created TensorDataset for {dataset_path.name} with {len(labels_tensor)} samples.")
-        return TensorDataset(sequences_tensor, labels_tensor)
+        self._log(f"Created TensorDataset for {dataset_path.name} with {len(tensorized_labels)} samples.")
+        return TensorDataset(torch.stack(tensorized_sequences), torch.stack(tensorized_labels))
 
     def run(self):
         monitor = ResourceMonitor()
         monitor.start()
         final_status = 'FAILED'
-
-        total_training_time = 0
-        total_testing_time = 0
+        total_training_time, total_testing_time = 0, 0
         final_model_metrics = {}
-        resource_metrics_history = []
-
-        progress_state = { 'global_step': 0, 'total_steps': 0, 'phase_steps': 0, 'phase_total_steps': 0, 'phase_start_time': 0 }
 
         try:
             if not self._initialize_run():
@@ -236,116 +211,106 @@ class TrainingController:
 
             self._log("Preparing datasets...")
             train_dataset_path = Path("datasets") / self.dataset_name / 'train.csv'
-            val_dataset_path = Path("datasets") / self.dataset_name / 'validation.csv'
             test_dataset_path = Path("datasets") / self.dataset_name / 'test.csv'
 
-            train_dataset = self._load_and_tensorize_dataset(train_dataset_path, encoder_model, encoder_tokenizer, progress_state)
-            validation_dataset = self._load_and_tensorize_dataset(val_dataset_path, encoder_model, encoder_tokenizer, progress_state) if val_dataset_path.exists() else None
-            test_dataset = self._load_and_tensorize_dataset(test_dataset_path, encoder_model, encoder_tokenizer, progress_state) if test_dataset_path.exists() else None
+            full_train_dataset = self._load_and_tensorize_dataset(train_dataset_path, encoder_model, encoder_tokenizer, {})
+            test_dataset = self._load_and_tensorize_dataset(test_dataset_path, encoder_model, encoder_tokenizer, {}) if test_dataset_path.exists() else None
 
+            self._log("Creating a 90/10 train/validation split from the training data.")
+            train_size = int(0.9 * len(full_train_dataset))
+            validation_size = len(full_train_dataset) - train_size
+            train_dataset, validation_dataset = random_split(full_train_dataset, [train_size, validation_size])
+            self._log(f"New training set size: {len(train_dataset)}")
+            self._log(f"New validation set size: {len(validation_dataset)}")
+            
             self._cleanup(model_to_clean=encoder_model)
             del encoder_tokenizer
 
-            if not train_dataset:
-                raise RuntimeError("Training dataset could not be loaded or created.")
-
             ft_path = None
-
-            self._log("Optimizing for Linux: Enabling torch.compile() for optimized performance.")
-
+            progress_state = {'global_step': 0, 'phase_start_time': 0}
+            
+            # Calculate total training steps for the progress bar
             train_steps = 0
             for phase_epochs in [self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('n_epochs_phase_full', 0)]:
                 if phase_epochs > 0:
-                    sampler = BalancedSampler(train_dataset.tensors[1].cpu().numpy(), self.hp.get('min_less_portion', 0.5))
+                    sampler = BalancedSampler(train_dataset.dataset.tensors[1][train_dataset.indices].cpu().numpy(), self.hp.get('min_less_portion', 0.5))
                     loader = DataLoader(train_dataset, batch_size=self.hp['micro_batch_size'], sampler=sampler, num_workers=self.num_workers)
                     train_steps += len(loader) * phase_epochs
-
-            progress_state['total_steps'] = progress_state['global_step'] + train_steps
-            progress_state['phase_start_time'] = time.time()
-
+            progress_state['total_steps'] = train_steps
 
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
             self.model = torch.compile(self.model, mode="max-autotune")
+            
             self.model.set_train_projector_and_classifier()
             success, ft_path, duration = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, progress_state)
             total_training_time += duration
 
             if success:
-                self._cleanup(self.model)
+                self._cleanup()
                 self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
                 self.model = torch.compile(self.model, mode="max-autotune")
                 self.model.set_finetuning_all()
                 _, ft_path, duration = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, progress_state)
                 total_training_time += duration
-                self._cleanup(self.model)
+                self._cleanup()
 
             self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, False, self.device, self._log)
             self.model = torch.compile(self.model, mode="max-autotune")
-
+            
             if validation_dataset:
                 val_metrics, val_duration = evaluate_and_visualize(self, validation_dataset, "validation")
                 final_model_metrics.update(val_metrics['validation'])
-
+            
             if test_dataset:
                 test_metrics, test_duration = evaluate_and_visualize(self, test_dataset, "test")
                 final_model_metrics.update(test_metrics['test'])
                 total_testing_time = test_duration
-
+            
             self.visualizer.plot_training_loss(self.batch_losses)
-
+            
             if ft_path and os.path.exists(ft_path):
                 final_model_path = self.execution_dir / 'output_model'
                 shutil.copytree(ft_path, final_model_path, dirs_exist_ok=True)
                 self._log(f"Final model saved to: {final_model_path}")
-
+            
             final_status = 'COMPLETED'
-
+        
         except Exception as e:
             tb_str = traceback.format_exc()
             error_msg = f"CRITICAL ERROR in run {self.run_id}: {e}\n{tb_str}"
             self._log(error_msg)
             if self.callback: self.callback({"error": f"{e}\n{tb_str}"})
             final_status = 'FAILED'
-
+            
         finally:
             total_run_time = time.time() - self.run_start_time
             resource_metrics_history = monitor.stop()
-
+            
             if self.run_id:
                 try:
                     if resource_metrics_history and 'summary' in resource_metrics_history and 'time_series' in resource_metrics_history:
                         summary = resource_metrics_history['summary']
                         ram_summary = summary.get('ram', {})
                         gpu_summary = summary.get('gpu', {})
-
                         db_metrics = {
-                            "total_run_time_sec": total_run_time,
-                            "training_time_sec": total_training_time,
-                            "testing_time_sec": total_testing_time,
-                            "accuracy": final_model_metrics.get(f"{'test' if test_dataset else 'validation'}_accuracy"),
-                            "precision": final_model_metrics.get(f"{'test' if test_dataset else 'validation'}_precision"),
-                            "f1_score": final_model_metrics.get(f"{'test' if test_dataset else 'validation'}_f1_score"),
-                            "recall": final_model_metrics.get(f"{'test' if test_dataset else 'validation'}_recall"),
-                            "avg_ram_usage_gb": ram_summary.get('avg_ram_usage_gb'),
-                            "peak_95_ram_usage_gb": ram_summary.get('p95_ram_usage_gb'),
-                            "avg_gpu_vram_gb": gpu_summary.get('avg_gpu_vram_gb'),
+                            "total_run_time_sec": total_run_time, "training_time_sec": total_training_time,
+                            "testing_time_sec": total_testing_time, "accuracy": final_model_metrics.get(f"{'test' if test_dataset else 'validation'}_accuracy"),
+                            "precision": final_model_metrics.get(f"{'test' if test_dataset else 'validation'}_precision"), "f1_score": final_model_metrics.get(f"{'test' if test_dataset else 'validation'}_f1_score"),
+                            "recall": final_model_metrics.get(f"{'test' if test_dataset else 'validation'}_recall"), "avg_ram_usage_gb": ram_summary.get('avg_ram_usage_gb'),
+                            "peak_95_ram_usage_gb": ram_summary.get('p95_ram_usage_gb'), "avg_gpu_vram_gb": gpu_summary.get('avg_gpu_vram_gb'),
                             "peak_95_gpu_vram_gb": gpu_summary.get('p95_gpu_vram_gb')
                         }
-
                         self.db.save_final_metrics(self.run_id, db_metrics)
-
                         if self.visualizer:
                             time_series_df = pd.DataFrame(resource_metrics_history['time_series'])
                             self.visualizer.plot_resource_usage(time_series_df)
                     else:
-                        self._log("No resource metrics recorded due to early crash or invalid format.")
-
+                        self._log("No resource metrics recorded.")
                 except Exception as e:
                     self._log(f"Failed to save metrics or plots: {e}")
-
                 report_path_str = str(self.execution_dir) if final_status == 'COMPLETED' else None
                 self.db.update_run_status(self.run_id, final_status, report_path_str)
-
-            if self.model: self._cleanup(self.model)
+                
+            if self.model: self._cleanup()
             if self.callback: self.callback({"status": final_status, "done": True})
