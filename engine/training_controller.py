@@ -20,7 +20,8 @@ from config import (
     DEFAULT_LLAMA_MODEL, get_hyperparameters
 )
 from utils.database_manager import DatabaseManager
-from utils.data_loader import LogDataset
+# We will use the preprocessing function directly, but not the class
+from utils.data_loader import replace_patterns
 from utils.resource_monitor import ResourceMonitor
 from utils.log_visualizer import LogVisualizer
 from logsentinel_model import LogSentinelModel
@@ -104,15 +105,18 @@ class TrainingController:
             temp_path = Path(temp_dir)
             chunk_files = []
 
-            with pd.read_csv(dataset_path, chunksize=100000) as reader:
+            with pd.read_csv(dataset_path, chunksize=100000, dtype={'Content': str}) as reader:
                 pbar = tqdm(reader, desc=f"Processing {dataset_path.name}", disable=self.is_gui_mode, unit=" chunks", total=total_chunks)
                 for i, chunk_df in enumerate(pbar):
                     if self.is_test_run:
                         chunk_df = chunk_df.sample(frac=self.test_run_percentage, random_state=42)
 
-                    # --- Embed and Tensorize one chunk at a time ---
-                    source_dataset = LogDataset(dataframe=chunk_df)
-                    all_logs_flat, start_positions = merge_data(source_dataset.sequences)
+                    # --- START OF FIX: Integrated, low-memory processing ---
+                    chunk_df['Processed_Content'] = chunk_df['Content'].apply(replace_patterns)
+                    sequences_in_chunk = [content.split(' ;-; ') for content in chunk_df['Processed_Content'].values]
+                    chunk_labels = chunk_df['Label'].fillna(-1).astype(int).values
+                    all_logs_flat, start_positions = merge_data(sequences_in_chunk)
+                    # --- END OF FIX ---
                     
                     if not all_logs_flat:
                         continue
@@ -130,9 +134,7 @@ class TrainingController:
                         
                     all_line_embeddings_tensor = torch.cat(all_line_embeddings, dim=0)
                     chunk_embeddings = list(torch.tensor_split(all_line_embeddings_tensor, start_positions[1:-1]))
-                    chunk_labels = source_dataset.get_all_labels()
-
-                    # --- Tensorize and save this chunk immediately ---
+                    
                     tensorized_sequences, tensorized_labels = [], []
                     max_seq_len = self.hp['max_seq_len']
                     sample_embedding_dim = all_line_embeddings_tensor.shape[1]
@@ -157,15 +159,12 @@ class TrainingController:
                         torch.save(chunk_tensors, chunk_file)
                         chunk_files.append(chunk_file)
                     
-                    # Explicitly free memory
-                    del source_dataset, all_logs_flat, all_line_embeddings, all_line_embeddings_tensor, chunk_embeddings, chunk_labels
-                    del tensorized_sequences, tensorized_labels, chunk_tensors
+                    del chunk_df, sequences_in_chunk, chunk_labels, all_logs_flat, all_line_embeddings, all_line_embeddings_tensor
+                    del chunk_embeddings, tensorized_sequences, tensorized_labels, chunk_tensors
                     gc.collect()
 
-            # --- Step 2: Assemble the final dataset from disk ---
             self._log("All chunks processed. Assembling final TensorDataset from disk...")
-            all_sequence_tensors = []
-            all_label_tensors = []
+            all_sequence_tensors, all_label_tensors = [], []
             for chunk_file in tqdm(chunk_files, desc="Assembling dataset"):
                 sequences, labels = torch.load(chunk_file)
                 all_sequence_tensors.append(sequences)
@@ -174,11 +173,7 @@ class TrainingController:
             if not all_sequence_tensors:
                 raise RuntimeError(f"No data was processed for {dataset_path.name}.")
 
-            final_sequences = torch.cat(all_sequence_tensors, dim=0)
-            final_labels = torch.cat(all_label_tensors, dim=0)
-            
-            self._log(f"Created final TensorDataset for {dataset_path.name} with {len(final_labels)} samples.")
-            return TensorDataset(final_sequences, final_labels)
+            return TensorDataset(torch.cat(all_sequence_tensors, dim=0), torch.cat(all_label_tensors, dim=0))
 
     def run(self):
         monitor = ResourceMonitor()
@@ -223,9 +218,10 @@ class TrainingController:
             progress_state = {'global_step': 0, 'phase_start_time': 0}
             
             train_steps = 0
-            # Correctly get labels from Subset for BalancedSampler
-            sampler_labels = train_dataset.dataset.tensors[1][train_dataset.indices].cpu().numpy()
-            sampler = BalancedSampler(sampler_labels, self.hp.get('min_less_portion', 0.5)) if self.dataset_name != "Thunderbird" else None
+            sampler = None
+            if self.dataset_name != "Thunderbird":
+                sampler_labels = train_dataset.dataset.tensors[1][train_dataset.indices].cpu().numpy()
+                sampler = BalancedSampler(sampler_labels, self.hp.get('min_less_portion', 0.5))
 
             for phase_epochs in [self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('n_epochs_phase_full', 0)]:
                 if phase_epochs > 0:

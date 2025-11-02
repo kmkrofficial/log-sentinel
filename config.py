@@ -19,10 +19,15 @@ DEFAULT_ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B"
 
 def get_optimal_workers():
+    """
+    Calculates the optimal number of data loader workers.
+    MODIFICATION: Capped at 8 workers to protect systems with high core counts
+    but limited RAM (like 32GB). This is a crucial change to prevent RAM OOM errors.
+    """
     try:
         cpu_count = psutil.cpu_count(logical=True)
-        # Use half of the available cores, up to a reasonable limit
-        return max(4, min(cpu_count // 2, 16))
+        # Use half the cores, but cap at a safe number for 32GB RAM systems.
+        return max(4, min(cpu_count // 2, 8))
     except Exception:
         return 4
 
@@ -33,7 +38,7 @@ BASE_HYPERPARAMETERS = {
     "lr_phase_full": 2e-5,
     "lora_r": 64,
     "batch_size": 128,
-    "micro_batch_size": 32,
+    "micro_batch_size": 32,      # MODIFICATION: Standardized to a safe default for 16GB VRAM.
     "max_content_len": 100,
     "max_seq_len": 128,
     "early_stopping_patience": 3,
@@ -58,9 +63,9 @@ DATASET_HYPERPARAMETERS = {
         "n_epochs_phase_full": 10,
     },
     "Thunderbird": {
-        "min_less_portion": 0.3,
-        "max_seq_len": 100,
-        "early_stopping_patience": 2,
+        "min_less_portion": 0.3, # This is ignored due to our code change, but kept for consistency
+        "max_seq_len": 256,
+        "early_stopping_patience": 4,
     },
     "default": {
         "min_less_portion": 0.5,
