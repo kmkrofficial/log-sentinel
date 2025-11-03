@@ -7,10 +7,11 @@ import pandas as pd
 import traceback
 import platform
 import numpy as np
+import h5py
 from tqdm import tqdm
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from torch.utils.data import TensorDataset, DataLoader, random_split
+from torch.utils.data import DataLoader, random_split
 from datetime import datetime
 
 from config import (
@@ -24,7 +25,7 @@ from utils.log_visualizer import LogVisualizer
 from logsentinel_model import LogSentinelModel
 from utils.helpers import merge_data, get_eta, format_time
 from engine.phase_manager import train_phase, evaluate_and_visualize
-from engine.data_utils import BalancedSampler
+from engine.data_utils import BalancedSampler, HDF5Dataset
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -83,25 +84,28 @@ class TrainingController:
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
-    def _load_and_tensorize_dataset(self, dataset_path, encoder_model, encoder_tokenizer, temp_dir, progress_start=0.0, progress_end=1.0):
-        self._log(f"Starting memory-safe embedding to disk for {dataset_path.name}...")
-        
+    def _embed_and_save_to_hdf5(self, dataset_path, h5_path, encoder_model, encoder_tokenizer, progress_start=0.0, progress_end=1.0):
+        self._log(f"Starting memory-safe embedding to {h5_path.name}...")
         embedding_chunk_size = self.hp['embedding_chunk_size']
-        SAVE_MICRO_CHUNK_SIZE = 2000
         
+        max_seq_len = self.hp['max_seq_len']
+        embedding_dim = self.hp['encoder_hidden_size']
+
+        with h5py.File(h5_path, 'w') as f:
+            f.create_dataset('sequences', (0, max_seq_len, embedding_dim), maxshape=(None, max_seq_len, embedding_dim), dtype='f4', chunks=(64, max_seq_len, embedding_dim))
+            f.create_dataset('labels', (0,), maxshape=(None,), dtype='i8', chunks=(1024,))
+
         try:
             total_chunks = sum(1 for _ in pd.read_csv(dataset_path, chunksize=embedding_chunk_size))
         except Exception as e:
             self._log(f"Could not read dataset {dataset_path}: {e}")
-            return None
+            return
 
-        chunk_files = []
-        micro_chunk_counter = 0
         with pd.read_csv(dataset_path, chunksize=embedding_chunk_size, dtype={'Content': str}) as reader:
             pbar = tqdm(reader, desc=f"Processing {dataset_path.name}", disable=self.is_gui_mode, unit=" chunks", total=total_chunks)
             for i, chunk_df in enumerate(pbar):
                 if self.is_gui_mode:
-                    local_progress = (i + 0.5) / total_chunks
+                    local_progress = (i + 0.5) / total_chunks if total_chunks > 0 else 0
                     global_progress = progress_start + (local_progress * (progress_end - progress_start))
                     self.callback({"status": f"Embedding {dataset_path.name}: Chunk {i+1}/{total_chunks}", "progress": global_progress})
 
@@ -111,11 +115,9 @@ class TrainingController:
                 sequences_in_chunk = [content.split(' ;-; ') for content in chunk_df['Processed_Content'].values]
                 chunk_labels = chunk_df['Label'].fillna(-1).astype(int).values
                 all_logs_flat, start_positions = merge_data(sequences_in_chunk)
-                
+
                 if not all_logs_flat: continue
 
-                # --- START OF FIX ---
-                # Reverted from a list comprehension to a standard for-loop to fix the NameError.
                 all_line_embeddings = []
                 for k in range(0, len(all_logs_flat), 512):
                     log_batch = all_logs_flat[k : k + 512]
@@ -124,49 +126,40 @@ class TrainingController:
                         model_output = encoder_model(**inputs)
                         embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
                         all_line_embeddings.append(embeddings.cpu())
-                # --- END OF FIX ---
-                
+
                 if not all_line_embeddings: continue
-                    
+
                 all_line_embeddings_tensor = torch.cat(all_line_embeddings, dim=0)
                 chunk_embeddings = list(torch.tensor_split(all_line_embeddings_tensor, start_positions[1:-1]))
-                
-                tensorized_sequences, tensorized_labels = [], []
-                max_seq_len, sample_embedding_dim = self.hp['max_seq_len'], all_line_embeddings_tensor.shape[1]
 
-                for seq_idx, (seq_embeddings, seq_label) in enumerate(zip(chunk_embeddings, chunk_labels)):
+                tensorized_sequences_list, tensorized_labels_list = [], []
+                for seq_embeddings, seq_label in zip(chunk_embeddings, chunk_labels):
                     seq_len = seq_embeddings.shape[0]
                     if seq_len == 0:
-                        tensorized_seq = torch.zeros(max_seq_len, sample_embedding_dim, dtype=torch.float32)
+                        tensorized_seq = torch.zeros(max_seq_len, embedding_dim, dtype=torch.float32)
                     elif seq_len > max_seq_len:
                         tensorized_seq = seq_embeddings[-max_seq_len:]
                     else:
-                        tensorized_seq = torch.cat([seq_embeddings, torch.zeros(max_seq_len - seq_len, sample_embedding_dim, dtype=torch.float32)], dim=0)
-                    tensorized_sequences.append(tensorized_seq)
-                    tensorized_labels.append(torch.tensor(seq_label, dtype=torch.long))
+                        tensorized_seq = torch.cat([seq_embeddings, torch.zeros(max_seq_len - seq_len, embedding_dim, dtype=torch.float32)], dim=0)
+                    tensorized_sequences_list.append(tensorized_seq)
+                    tensorized_labels_list.append(torch.tensor(seq_label, dtype=torch.long))
 
-                    if len(tensorized_sequences) >= SAVE_MICRO_CHUNK_SIZE:
-                        chunk_file = Path(temp_dir) / f"micro_chunk_{micro_chunk_counter}.pt"
-                        torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file, _use_new_zipfile_serialization=True)
-                        chunk_files.append(chunk_file)
-                        tensorized_sequences, tensorized_labels = [], []
-                        micro_chunk_counter += 1
+                if not tensorized_sequences_list: continue
                 
-                if tensorized_sequences:
-                    chunk_file = Path(temp_dir) / f"micro_chunk_{micro_chunk_counter}.pt"
-                    torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file, _use_new_zipfile_serialization=True)
-                    chunk_files.append(chunk_file)
-                    micro_chunk_counter += 1
+                sequences_to_save = torch.stack(tensorized_sequences_list).numpy()
+                labels_to_save = torch.stack(tensorized_labels_list).numpy()
+
+                with h5py.File(h5_path, 'a') as f:
+                    num_new = len(labels_to_save)
+                    f['sequences'].resize((f['sequences'].shape[0] + num_new, max_seq_len, embedding_dim))
+                    f['sequences'][-num_new:] = sequences_to_save
+                    f['labels'].resize((f['labels'].shape[0] + num_new,))
+                    f['labels'][-num_new:] = labels_to_save
                 
                 del chunk_df, sequences_in_chunk, chunk_labels, all_logs_flat, all_line_embeddings, all_line_embeddings_tensor, chunk_embeddings
                 gc.collect()
 
-        self._log("Assembling final TensorDataset from disk...")
-        all_tensors = [torch.load(f) for f in tqdm(chunk_files, desc="Assembling dataset")]
-        
-        if not all_tensors: raise RuntimeError(f"No data processed for {dataset_path.name}.")
-
-        return TensorDataset(torch.cat([t[0] for t in all_tensors]), torch.cat([t[1] for t in all_tensors]))
+        self._log(f"Finished embedding to HDF5 file: {h5_path.name}")
 
     def run(self):
         monitor = ResourceMonitor()
@@ -174,17 +167,16 @@ class TrainingController:
         final_status = 'FAILED'
         total_training_time, total_testing_time = 0, 0
         final_model_metrics = {}
-        temp_embedding_dir = None
-        test_dataset = None
+        embedding_root_dir = None
 
         try:
             if not self._initialize_run():
                 raise RuntimeError("Failed to create a new run record.")
             self.run_start_time = time.time()
-            
-            temp_embedding_dir = self.execution_dir / "_temp_embeddings"
-            temp_embedding_dir.mkdir(exist_ok=True)
-            self._log(f"Using controlled temp directory for embeddings: {temp_embedding_dir}")
+
+            embedding_root_dir = self.execution_dir / "_temp_embeddings"
+            embedding_root_dir.mkdir(exist_ok=True)
+            self._log(f"Using controlled temp directory for embeddings: {embedding_root_dir}")
 
             encoder_config = AutoConfig.from_pretrained(self.encoder_path_str)
             self.hp['encoder_hidden_size'] = encoder_config.hidden_size
@@ -196,42 +188,32 @@ class TrainingController:
             self._log("Preparing datasets...")
             train_dataset_path = Path("datasets") / self.dataset_name / 'train.csv'
             test_dataset_path = Path("datasets") / self.dataset_name / 'test.csv'
-
-            full_train_dataset = self._load_and_tensorize_dataset(train_dataset_path, encoder_model, encoder_tokenizer, temp_embedding_dir, progress_start=0.0, progress_end=0.45)
             
+            train_h5_path = embedding_root_dir / "train.h5"
+            self._embed_and_save_to_hdf5(train_dataset_path, train_h5_path, encoder_model, encoder_tokenizer, progress_start=0.0, progress_end=0.45)
+            full_train_dataset = HDF5Dataset(train_h5_path)
+
+            test_dataset = None
             if test_dataset_path.exists():
-                test_dataset = self._load_and_tensorize_dataset(test_dataset_path, encoder_model, encoder_tokenizer, temp_embedding_dir, progress_start=0.45, progress_end=0.5)
-            else:
-                test_dataset = None
+                test_h5_path = embedding_root_dir / "test.h5"
+                self._embed_and_save_to_hdf5(test_dataset_path, test_h5_path, encoder_model, encoder_tokenizer, progress_start=0.45, progress_end=0.5)
+                test_dataset = HDF5Dataset(test_h5_path)
 
             self._log("Creating a 90/10 train/validation split from the training data.")
             train_size = int(0.9 * len(full_train_dataset))
             validation_size = len(full_train_dataset) - train_size
             train_dataset, validation_dataset = random_split(full_train_dataset, [train_size, validation_size])
-            
+
             self._cleanup(model_to_clean=encoder_model)
             del encoder_tokenizer
-            
+
             ft_path = None
-            progress_state = {'global_step': 0, 'phase_start_time': 0}
             
-            train_steps = 0
-            sampler = None
-            if self.dataset_name != "Thunderbird":
-                sampler_labels = train_dataset.dataset.tensors[1][train_dataset.indices].cpu().numpy()
-                sampler = BalancedSampler(sampler_labels, self.hp.get('min_less_portion', 0.5))
-
-            for phase_epochs in [self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('n_epochs_phase_full', 0)]:
-                if phase_epochs > 0:
-                    loader = DataLoader(train_dataset, batch_size=self.hp['micro_batch_size'], sampler=sampler, num_workers=self.num_workers, shuffle=(sampler is None))
-                    train_steps += len(loader) * phase_epochs
-            progress_state['total_steps'] = train_steps
-
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
             self.model = torch.compile(self.model, mode="max-autotune")
-            
+
             self.model.set_train_projector_and_classifier()
-            success, ft_path, duration = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, progress_state, progress_start=0.5, progress_end=0.75)
+            success, ft_path, duration = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, {}, progress_start=0.5, progress_end=0.75)
             total_training_time += duration
 
             if success:
@@ -239,41 +221,41 @@ class TrainingController:
                 self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
                 self.model = torch.compile(self.model, mode="max-autotune")
                 self.model.set_finetuning_all()
-                _, ft_path, duration = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, progress_state, progress_start=0.75, progress_end=1.0)
+                _, ft_path, duration = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, {}, progress_start=0.75, progress_end=1.0)
                 total_training_time += duration
                 self._cleanup()
 
             self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, False, self.device, self._log)
             self.model = torch.compile(self.model, mode="max-autotune")
-            
+
             if validation_dataset:
                 val_metrics, val_duration = evaluate_and_visualize(self, validation_dataset, "validation")
                 final_model_metrics.update(val_metrics['validation'])
-            
+
             if test_dataset:
                 test_metrics, test_duration = evaluate_and_visualize(self, test_dataset, "test")
                 final_model_metrics.update(test_metrics['test'])
                 total_testing_time = test_duration
-            
+
             self.visualizer.plot_training_loss(self.batch_losses)
-            
+
             if ft_path and os.path.exists(ft_path):
                 shutil.copytree(ft_path, self.execution_dir / 'output_model', dirs_exist_ok=True)
                 self._log(f"Final model saved to: {self.execution_dir / 'output_model'}")
-            
+
             final_status = 'COMPLETED'
-        
+
         except Exception as e:
             tb_str = traceback.format_exc()
             self._log(f"CRITICAL ERROR in run {self.run_id}: {e}\n{tb_str}")
             if self.callback: self.callback({"error": f"{e}\n{tb_str}"})
             final_status = 'FAILED'
-            
+
         finally:
-            if temp_embedding_dir and temp_embedding_dir.exists():
-                self._log(f"Cleaning up temporary embedding directory: {temp_embedding_dir}")
-                shutil.rmtree(temp_embedding_dir)
+            if embedding_root_dir and embedding_root_dir.exists():
+                self._log(f"Cleaning up temporary embedding directory: {embedding_root_dir}")
+                shutil.rmtree(embedding_root_dir)
 
             total_run_time = time.time() - self.run_start_time
             resource_metrics = monitor.stop()
@@ -295,7 +277,7 @@ class TrainingController:
                             self.visualizer.plot_resource_usage(pd.DataFrame(resource_metrics['time_series']))
                 except Exception as e:
                     self._log(f"Failed to save final metrics or plots: {e}")
-                
+
                 report_path = str(self.execution_dir) if final_status == 'COMPLETED' else None
                 self.db.update_run_status(self.run_id, final_status, report_path)
             if self.model: self._cleanup()

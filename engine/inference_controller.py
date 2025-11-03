@@ -7,10 +7,11 @@ import pandas as pd
 import traceback
 import platform
 import numpy as np
+import h5py
 from tqdm import tqdm
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 
 from config import (
     EXECUTIONS_DIR, MODELS_DIR, DEFAULT_ENCODER_MODEL,
@@ -19,6 +20,7 @@ from config import (
 from utils.data_loader import replace_patterns
 from logsentinel_model import LogSentinelModel
 from utils.helpers import merge_data, format_time
+from engine.data_utils import HDF5Dataset
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -52,18 +54,24 @@ class InferenceController:
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
-    def _load_and_tensorize_dataset(self, dataset_path, encoder_model, encoder_tokenizer, temp_dir):
-        self._log(f"Starting memory-safe embedding to disk for {dataset_path.name}...")
+    def _embed_and_save_to_hdf5(self, dataset_path, h5_path, encoder_model, encoder_tokenizer):
+        self._log(f"Starting memory-safe embedding to {h5_path.name}...")
         embedding_chunk_size = self.hp['embedding_chunk_size']
-        SAVE_MICRO_CHUNK_SIZE = 2000
         
+        encoder_config = AutoConfig.from_pretrained(self.encoder_path_str)
+        max_seq_len = self.hp['max_seq_len']
+        embedding_dim = encoder_config.hidden_size
+
+        with h5py.File(h5_path, 'w') as f:
+            f.create_dataset('sequences', (0, max_seq_len, embedding_dim), maxshape=(None, max_seq_len, embedding_dim), dtype='f4', chunks=(64, max_seq_len, embedding_dim))
+            f.create_dataset('labels', (0,), maxshape=(None,), dtype='i8', chunks=(1024,))
+
         try:
             total_chunks = sum(1 for _ in pd.read_csv(dataset_path, chunksize=embedding_chunk_size))
         except Exception as e:
             self._log(f"Could not read dataset {dataset_path}: {e}")
-            return None
+            return
 
-        chunk_files, micro_chunk_counter = [], 0
         with pd.read_csv(dataset_path, chunksize=embedding_chunk_size, dtype={'Content': str}) as reader:
             pbar = tqdm(reader, desc=f"Processing {dataset_path.name}", disable=self.is_gui_mode, unit=" chunks", total=total_chunks)
             for i, chunk_df in enumerate(pbar):
@@ -73,10 +81,9 @@ class InferenceController:
                 sequences_in_chunk = [content.split(' ;-; ') for content in chunk_df['Processed_Content'].values]
                 chunk_labels = chunk_df['Label'].fillna(-1).astype(int).values
                 all_logs_flat, start_positions = merge_data(sequences_in_chunk)
-                
+
                 if not all_logs_flat: continue
 
-                # --- START OF FIX ---
                 all_line_embeddings = []
                 for k in range(0, len(all_logs_flat), 512):
                     log_batch = all_logs_flat[k : k + 512]
@@ -85,48 +92,40 @@ class InferenceController:
                         model_output = encoder_model(**inputs)
                         embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
                         all_line_embeddings.append(embeddings.cpu())
-                # --- END OF FIX ---
 
                 if not all_line_embeddings: continue
-                    
+
                 all_line_embeddings_tensor = torch.cat(all_line_embeddings, dim=0)
                 chunk_embeddings = list(torch.tensor_split(all_line_embeddings_tensor, start_positions[1:-1]))
-                
-                tensorized_sequences, tensorized_labels = [], []
-                max_seq_len, sample_embedding_dim = self.hp['max_seq_len'], all_line_embeddings_tensor.shape[1]
 
+                tensorized_sequences_list, tensorized_labels_list = [], []
                 for seq_embeddings, seq_label in zip(chunk_embeddings, chunk_labels):
                     seq_len = seq_embeddings.shape[0]
                     if seq_len == 0:
-                        tensorized_seq = torch.zeros(max_seq_len, sample_embedding_dim, dtype=torch.float32)
+                        tensorized_seq = torch.zeros(max_seq_len, embedding_dim, dtype=torch.float32)
                     elif seq_len > max_seq_len:
                         tensorized_seq = seq_embeddings[-max_seq_len:]
                     else:
-                        tensorized_seq = torch.cat([seq_embeddings, torch.zeros(max_seq_len - seq_len, sample_embedding_dim, dtype=torch.float32)], dim=0)
-                    tensorized_sequences.append(tensorized_seq)
-                    tensorized_labels.append(torch.tensor(seq_label, dtype=torch.long))
+                        tensorized_seq = torch.cat([seq_embeddings, torch.zeros(max_seq_len - seq_len, embedding_dim, dtype=torch.float32)], dim=0)
+                    tensorized_sequences_list.append(tensorized_seq)
+                    tensorized_labels_list.append(torch.tensor(seq_label, dtype=torch.long))
 
-                    if len(tensorized_sequences) >= SAVE_MICRO_CHUNK_SIZE:
-                        chunk_file = Path(temp_dir) / f"micro_chunk_{micro_chunk_counter}.pt"
-                        torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file, _use_new_zipfile_serialization=True)
-                        chunk_files.append(chunk_file)
-                        tensorized_sequences, tensorized_labels = [], []
-                        micro_chunk_counter += 1
-                
-                if tensorized_sequences:
-                    chunk_file = Path(temp_dir) / f"micro_chunk_{micro_chunk_counter}.pt"
-                    torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file, _use_new_zipfile_serialization=True)
-                    chunk_files.append(chunk_file)
-                    micro_chunk_counter += 1
-                
+                if not tensorized_sequences_list: continue
+
+                sequences_to_save = torch.stack(tensorized_sequences_list).numpy()
+                labels_to_save = torch.stack(tensorized_labels_list).numpy()
+
+                with h5py.File(h5_path, 'a') as f:
+                    num_new = len(labels_to_save)
+                    f['sequences'].resize((f['sequences'].shape[0] + num_new, max_seq_len, embedding_dim))
+                    f['sequences'][-num_new:] = sequences_to_save
+                    f['labels'].resize((f['labels'].shape[0] + num_new,))
+                    f['labels'][-num_new:] = labels_to_save
+
                 del chunk_df, sequences_in_chunk, chunk_labels, all_logs_flat, all_line_embeddings, all_line_embeddings_tensor, chunk_embeddings
                 gc.collect()
+        self._log(f"Finished embedding to HDF5 file: {h5_path.name}")
 
-        self._log("Assembling final TensorDataset from disk...")
-        all_tensors = [torch.load(f) for f in tqdm(chunk_files, desc="Assembling dataset")]
-        if not all_tensors: raise RuntimeError(f"No data processed for {dataset_path.name}.")
-        return TensorDataset(torch.cat([t[0] for t in all_tensors]), torch.cat([t[1] for t in all_tensors]))
-            
     def run_inference(self):
         start_time = time.time()
         temp_embedding_dir = None
@@ -141,10 +140,12 @@ class InferenceController:
 
             self._log("Preparing dataset for inference...")
             dataset_path = Path("datasets") / self.dataset_name / 'test.csv'
-            dataset = self._load_and_tensorize_dataset(dataset_path, encoder_model, encoder_tokenizer, temp_embedding_dir)
+            h5_path = temp_embedding_dir / "inference_data.h5"
+            self._embed_and_save_to_hdf5(dataset_path, h5_path, encoder_model, encoder_tokenizer)
+            dataset = HDF5Dataset(h5_path)
             self._cleanup(model_to_clean=encoder_model)
             del encoder_tokenizer
-            
+
             if not dataset: raise RuntimeError("Inference dataset could not be loaded.")
 
             self._log(f"Loading fine-tuned model from: {self.model_run_path}")
@@ -162,7 +163,7 @@ class InferenceController:
 
             loader = DataLoader(dataset, batch_size=self.hp['micro_batch_size'] * 2, num_workers=self.num_workers, pin_memory=True)
             all_preds, all_probs = [], []
-            
+
             with torch.no_grad():
                 for i, (sequences, _) in enumerate(tqdm(loader, desc="Running inference", disable=self.is_gui_mode)):
                     sequences = sequences.to(self.device, non_blocking=True)
@@ -170,11 +171,11 @@ class InferenceController:
                     probs = torch.softmax(logits, dim=1)[:, 1].float().cpu().numpy()
                     all_preds.extend((probs > 0.5).astype(int))
                     all_probs.extend(probs)
-            
+
             output_df = pd.DataFrame({'prediction': all_preds, 'anomaly_probability': all_probs})
             output_path = self.model_run_path / self.output_filename
             output_df.to_csv(output_path, index=False)
-            
+
             self._log(f"Inference complete in {format_time(time.time() - start_time)}.")
             self._log(f"Predictions saved to: {output_path}")
 

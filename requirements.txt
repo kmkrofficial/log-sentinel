@@ -18,3 +18,4 @@ sentence-transformers
 py-cpuinfo
 wheel
 flash-attn
+h5py
