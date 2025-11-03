@@ -12,6 +12,7 @@ from pathlib import Path
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from datetime import datetime
+import tempfile
 
 from config import (
     EXECUTIONS_DIR, MODELS_DIR, DEFAULT_ENCODER_MODEL,
@@ -83,8 +84,8 @@ class TrainingController:
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
-    def _load_and_tensorize_dataset(self, dataset_path, encoder_model, encoder_tokenizer, temp_dir):
-        self._log(f"Starting memory-safe embedding to disk for {dataset_path.name}...")
+    def _load_and_tensorize_dataset(self, dataset_path, encoder_model, encoder_tokenizer, temp_dir, progress_start=0.0, progress_end=1.0):
+        self._log(f"Starting memory-safe embedding for {dataset_path.name}...")
         
         embedding_chunk_size = self.hp['embedding_chunk_size']
         
@@ -98,6 +99,13 @@ class TrainingController:
         with pd.read_csv(dataset_path, chunksize=embedding_chunk_size, dtype={'Content': str}) as reader:
             pbar = tqdm(reader, desc=f"Processing {dataset_path.name}", disable=self.is_gui_mode, unit=" chunks", total=total_chunks)
             for i, chunk_df in enumerate(pbar):
+                # --- START OF CHANGE: Granular progress reporting ---
+                if self.is_gui_mode:
+                    local_progress = (i + 0.5) / total_chunks
+                    global_progress = progress_start + (local_progress * (progress_end - progress_start))
+                    self.callback({"status": f"Embedding {dataset_path.name}: Processing chunk {i+1}/{total_chunks}", "progress": global_progress})
+                # --- END OF CHANGE ---
+
                 if self.is_test_run:
                     chunk_df = chunk_df.sample(frac=self.test_run_percentage, random_state=42)
 
@@ -136,7 +144,7 @@ class TrainingController:
 
                 if tensorized_sequences:
                     chunk_file = Path(temp_dir) / f"chunk_{i}.pt"
-                    torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file)
+                    torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file, _use_new_zipfile_serialization=True)
                     chunk_files.append(chunk_file)
                 
                 del chunk_df, sequences_in_chunk, chunk_labels, all_logs_flat, all_line_embeddings, all_line_embeddings_tensor, chunk_embeddings
@@ -156,17 +164,16 @@ class TrainingController:
         total_training_time, total_testing_time = 0, 0
         final_model_metrics = {}
         temp_embedding_dir = None
+        test_dataset = None
 
         try:
             if not self._initialize_run():
                 raise RuntimeError("Failed to create a new run record.")
             self.run_start_time = time.time()
             
-            # --- START OF FIX: Create a controlled temporary directory ---
             temp_embedding_dir = self.execution_dir / "_temp_embeddings"
             temp_embedding_dir.mkdir(exist_ok=True)
             self._log(f"Using controlled temp directory for embeddings: {temp_embedding_dir}")
-            # --- END OF FIX ---
 
             encoder_config = AutoConfig.from_pretrained(self.encoder_path_str)
             self.hp['encoder_hidden_size'] = encoder_config.hidden_size
@@ -179,8 +186,14 @@ class TrainingController:
             train_dataset_path = Path("datasets") / self.dataset_name / 'train.csv'
             test_dataset_path = Path("datasets") / self.dataset_name / 'test.csv'
 
-            full_train_dataset = self._load_and_tensorize_dataset(train_dataset_path, encoder_model, encoder_tokenizer, temp_embedding_dir)
-            test_dataset = self._load_and_tensorize_dataset(test_dataset_path, encoder_model, encoder_tokenizer, temp_embedding_dir) if test_dataset_path.exists() else None
+            # --- START OF CHANGE: Define progress budgets ---
+            full_train_dataset = self._load_and_tensorize_dataset(train_dataset_path, encoder_model, encoder_tokenizer, temp_embedding_dir, progress_start=0.0, progress_end=0.45)
+            
+            if test_dataset_path.exists():
+                test_dataset = self._load_and_tensorize_dataset(test_dataset_path, encoder_model, encoder_tokenizer, temp_embedding_dir, progress_start=0.45, progress_end=0.5)
+            else:
+                test_dataset = None
+            # --- END OF CHANGE ---
 
             self._log("Creating a 90/10 train/validation split from the training data.")
             train_size = int(0.9 * len(full_train_dataset))
@@ -208,8 +221,9 @@ class TrainingController:
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
             self.model = torch.compile(self.model, mode="max-autotune")
             
+            # --- START OF CHANGE: Pass progress budget to training phases ---
             self.model.set_train_projector_and_classifier()
-            success, ft_path, duration = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, progress_state)
+            success, ft_path, duration = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, progress_state, progress_start=0.5, progress_end=0.75)
             total_training_time += duration
 
             if success:
@@ -217,9 +231,10 @@ class TrainingController:
                 self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
                 self.model = torch.compile(self.model, mode="max-autotune")
                 self.model.set_finetuning_all()
-                _, ft_path, duration = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, progress_state)
+                _, ft_path, duration = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, progress_state, progress_start=0.75, progress_end=1.0)
                 total_training_time += duration
                 self._cleanup()
+            # --- END OF CHANGE ---
 
             self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, False, self.device, self._log)
@@ -249,11 +264,9 @@ class TrainingController:
             final_status = 'FAILED'
             
         finally:
-            # --- START OF FIX: Robust cleanup ---
             if temp_embedding_dir and temp_embedding_dir.exists():
                 self._log(f"Cleaning up temporary embedding directory: {temp_embedding_dir}")
                 shutil.rmtree(temp_embedding_dir)
-            # --- END OF FIX ---
 
             total_run_time = time.time() - self.run_start_time
             resource_metrics = monitor.stop()
@@ -261,11 +274,12 @@ class TrainingController:
                 try:
                     if resource_metrics and 'summary' in resource_metrics:
                         summary = resource_metrics['summary']
+                        metric_prefix = 'test' if test_dataset else 'validation'
                         db_metrics = {
                             "total_run_time_sec": total_run_time, "training_time_sec": total_training_time,
-                            "testing_time_sec": total_testing_time, "accuracy": final_model_metrics.get(f"{'test' if 'test_dataset' in locals() and test_dataset else 'validation'}_accuracy"),
-                            "precision": final_model_metrics.get(f"{'test' if 'test_dataset' in locals() and test_dataset else 'validation'}_precision"), "f1_score": final_model_metrics.get(f"{'test' if 'test_dataset' in locals() and test_dataset else 'validation'}_f1_score"),
-                            "recall": final_model_metrics.get(f"{'test' if 'test_dataset' in locals() and test_dataset else 'validation'}_recall"),
+                            "testing_time_sec": total_testing_time, "accuracy": final_model_metrics.get(f"{metric_prefix}_accuracy"),
+                            "precision": final_model_metrics.get(f"{metric_prefix}_precision"), "f1_score": final_model_metrics.get(f"{metric_prefix}_f1_score"),
+                            "recall": final_model_metrics.get(f"{metric_prefix}_recall"),
                             "avg_ram_usage_gb": summary.get('ram', {}).get('avg_ram_usage_gb'), "peak_95_ram_usage_gb": summary.get('ram', {}).get('p95_ram_usage_gb'),
                             "avg_gpu_vram_gb": summary.get('gpu', {}).get('avg_gpu_vram_gb'), "peak_95_gpu_vram_gb": summary.get('gpu', {}).get('p95_gpu_vram_gb')
                         }

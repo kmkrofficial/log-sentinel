@@ -104,7 +104,13 @@ class InferenceController:
 
                 if tensorized_sequences:
                     chunk_file = Path(temp_dir) / f"chunk_{i}.pt"
-                    torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file)
+                    # --- START OF FIX ---
+                    torch.save(
+                        (torch.stack(tensorized_sequences), torch.stack(tensorized_labels)),
+                        chunk_file,
+                        _use_new_zipfile_serialization=True
+                    )
+                    # --- END OF FIX ---
                     chunk_files.append(chunk_file)
                 
                 del chunk_df, sequences_in_chunk, chunk_labels, all_logs_flat, all_line_embeddings, all_line_embeddings_tensor, chunk_embeddings
@@ -119,11 +125,9 @@ class InferenceController:
         start_time = time.time()
         temp_embedding_dir = None
         try:
-            # --- START OF FIX: Create a controlled temporary directory ---
             temp_embedding_dir = self.model_run_path / "_temp_inference_embeddings"
             temp_embedding_dir.mkdir(exist_ok=True)
             self._log(f"Using controlled temp directory for embeddings: {temp_embedding_dir}")
-            # --- END OF FIX ---
 
             encoder_config = AutoConfig.from_pretrained(self.encoder_path_str)
             encoder_tokenizer = AutoTokenizer.from_pretrained(self.encoder_path_str)
@@ -173,9 +177,7 @@ class InferenceController:
             self._log(f"CRITICAL ERROR in inference: {e}\n{tb_str}")
             if self.callback: self.callback({"error": f"{e}\n{tb_str}"})
         finally:
-            # --- START OF FIX: Robust cleanup ---
             if temp_embedding_dir and temp_embedding_dir.exists():
                 self._log(f"Cleaning up temporary inference directory: {temp_embedding_dir}")
                 shutil.rmtree(temp_embedding_dir)
-            # --- END OF FIX ---
             self._cleanup()

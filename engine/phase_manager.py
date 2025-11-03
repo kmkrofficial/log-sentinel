@@ -15,7 +15,7 @@ from utils.helpers import format_time, get_eta
 if TYPE_CHECKING:
     from engine.training_controller import TrainingController
 
-def train_phase(controller: 'TrainingController', phase_name, num_epochs, learning_rate, train_dataset, validation_dataset, progress_state):
+def train_phase(controller: 'TrainingController', phase_name, num_epochs, learning_rate, train_dataset, validation_dataset, progress_state, progress_start=0.0, progress_end=1.0):
     phase_start_time = time.time()
     
     if num_epochs == 0:
@@ -23,30 +23,30 @@ def train_phase(controller: 'TrainingController', phase_name, num_epochs, learni
         return True, None, 0
 
     controller._log(f"\n>>>> STARTING {phase_name.upper()} PHASE <<<<")
-    controller._log(f"Epochs: {num_epochs}, LR: {learning_rate}, Num Workers: {controller.num_workers}")
     
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, controller.model.parameters()), lr=learning_rate)
     criterion = FocalLoss().to(controller.device)
     
-    # Handle Subset object from random_split
-    if isinstance(train_dataset, torch.utils.data.Subset):
-        sampler_labels = train_dataset.dataset.tensors[1][train_dataset.indices].cpu().numpy()
-    else:
-        sampler_labels = train_dataset.tensors[1].cpu().numpy()
-        
-    sampler = BalancedSampler(sampler_labels, controller.hp['min_less_portion'])
+    sampler = None
+    if controller.dataset_name != "Thunderbird":
+        if isinstance(train_dataset, torch.utils.data.Subset):
+            sampler_labels = train_dataset.dataset.tensors[1][train_dataset.indices].cpu().numpy()
+        else:
+            sampler_labels = train_dataset.tensors[1].cpu().numpy()
+        sampler = BalancedSampler(sampler_labels, controller.hp['min_less_portion'])
+    
     train_loader = DataLoader(
         train_dataset, batch_size=controller.hp['micro_batch_size'],
         sampler=sampler, num_workers=controller.num_workers,
-        pin_memory=True, drop_last=True
+        pin_memory=True, drop_last=True,
+        shuffle=(sampler is None)
     )
     
     best_metric, patience_counter, best_model_path = -1, 0, None
-    metric_key = controller.hp['early_stopping_metric']
-    min_delta = controller.hp['early_stopping_min_delta']
+    metric_key, min_delta = controller.hp['early_stopping_metric'], controller.hp['early_stopping_min_delta']
     
-    if progress_state.get('phase_start_time') is None:
-        progress_state['phase_start_time'] = time.time()
+    phase_total_steps = len(train_loader) * num_epochs
+    phase_steps_done = 0
 
     for epoch in range(num_epochs):
         controller._log(f"\n--- Epoch {epoch + 1}/{num_epochs} ({phase_name}) ---")
@@ -64,26 +64,24 @@ def train_phase(controller: 'TrainingController', phase_name, num_epochs, learni
             loss.backward()
             optimizer.step()
             
-            batch_loss = loss.item()
-            epoch_loss += batch_loss
-            controller.batch_losses.append(batch_loss)
-            progress_state['global_step'] += 1
+            controller.batch_losses.append(loss.item())
+            phase_steps_done += 1
             
-            if i % 20 == 0 or i == len(train_loader) - 1:
-                metrics = {'loss': batch_loss, 'lr': optimizer.param_groups[0]['lr']}
-                eta_str = get_eta(progress_state['phase_start_time'], progress_state['global_step'], progress_state['total_steps'])
-                if not pbar.disable: pbar.set_postfix(metrics)
-                if controller.is_gui_mode:
-                    controller.callback({
-                        "progress": progress_state['global_step'] / progress_state['total_steps'] if progress_state['total_steps'] > 0 else 0,
-                        "status": f"Epoch {epoch+1} ({phase_name}) - Batch {i+1}/{len(train_loader)} - ETA: {eta_str}",
-                        "metrics": metrics
-                    })
+            if controller.is_gui_mode and i % 20 == 0:
+                # --- START OF CHANGE: Calculate progress within the allocated budget ---
+                local_progress = phase_steps_done / phase_total_steps if phase_total_steps > 0 else 0
+                global_progress = progress_start + (local_progress * (progress_end - progress_start))
+                # --- END OF CHANGE ---
 
-        controller._log(f"Epoch {epoch + 1} Complete. Avg Loss: {epoch_loss / len(train_loader):.4f}, Time: {format_time(time.time() - epoch_start_time)}")
+                controller.callback({
+                    "progress": global_progress,
+                    "status": f"Training ({phase_name}): Epoch {epoch+1}, Batch {i+1}/{len(train_loader)}",
+                    "metrics": {'loss': loss.item(), 'lr': optimizer.param_groups[0]['lr']}
+                })
+
+        controller._log(f"Epoch {epoch + 1} Complete. Avg Loss: {np.mean(controller.batch_losses[-len(train_loader):]):.4f}, Time: {format_time(time.time() - epoch_start_time)}")
 
         if validation_dataset:
-            controller._log("Running validation...")
             val_metrics, _ = evaluate(controller, validation_dataset, "validation", epoch)
             current_metric = val_metrics.get(f'validation_{metric_key}', -1)
             
@@ -95,20 +93,19 @@ def train_phase(controller: 'TrainingController', phase_name, num_epochs, learni
                 best_model_path = temp_model_dir
             else:
                 patience_counter += 1
-                controller._log(f"No improvement. {metric_key.capitalize()}: {current_metric:.4f}. Patience: {patience_counter}/{controller.hp['early_stopping_patience']}")
+                controller._log(f"No improvement. Patience: {patience_counter}/{controller.hp['early_stopping_patience']}")
 
             if patience_counter >= controller.hp['early_stopping_patience']:
                 controller._log("Early stopping triggered.")
                 break
     
     if not best_model_path and not validation_dataset:
-        controller._log("No validation dataset. Saving final model for phase.")
-        temp_model_dir = os.path.join(controller.execution_dir, f"temp_model_{phase_name}")
-        controller.model.save_ft_model(temp_model_dir)
-        best_model_path = temp_model_dir
+        best_model_path = os.path.join(controller.execution_dir, f"temp_model_{phase_name}")
+        controller.model.save_ft_model(best_model_path)
     
     return True, best_model_path, time.time() - phase_start_time
 
+# ... (rest of the file is unchanged, only train_phase was modified) ...
 def evaluate(controller: 'TrainingController', dataset, dataset_name, epoch=-1):
     start_time = time.time()
     controller.model.eval()
@@ -149,10 +146,7 @@ def evaluate_and_visualize(controller: 'TrainingController', dataset, dataset_na
             all_labels, all_probs = [], []
             controller.model.eval()
             with torch.no_grad():
-                for i, (sequences, labels) in enumerate(loader):
-                    if controller.is_gui_mode and i % 10 == 0:
-                        controller.callback({"status": f"Generating plots for {dataset_name}: Batch {i+1}/{len(loader)}"})
-                    
+                for i, (sequences, labels) in enumerate(tqdm(loader, desc=f"Generating plots for {dataset_name}", disable=True)):
                     sequences = sequences.to(controller.device, non_blocking=True)
                     logits, _ = controller.model.get_logits(sequences)
                     probs = torch.softmax(logits, dim=1)[:, 1].float().cpu().numpy()
