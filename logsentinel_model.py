@@ -43,15 +43,17 @@ class LogSentinelModel(nn.Module):
         self._setup_peft(ft_path, is_train_mode)
 
         if ft_path:
-            projector_path = os.path.join(ft_path, 'projector.pt')
-            classifier_path = os.path.join(ft_path, 'classifier.pt')
-            if os.path.exists(projector_path):
-                self._log(f"Loading projector weights from {projector_path}")
-                self.projector.load_state_dict(torch.load(projector_path, map_location=projector_device))
-            if os.path.exists(classifier_path):
-                self._log(f"Loading classifier weights from {classifier_path}")
-                self.classifier.load_state_dict(torch.load(classifier_path, map_location=projector_device))
+            self.load_ft_model(ft_path)
 
+    def load_ft_model(self, path):
+        projector_path = os.path.join(path, 'projector.pt')
+        classifier_path = os.path.join(path, 'classifier.pt')
+        if os.path.exists(projector_path):
+            self._log(f"Loading projector weights from {projector_path}")
+            self.projector.load_state_dict(torch.load(projector_path, map_location=self.llama_model.device))
+        if os.path.exists(classifier_path):
+            self._log(f"Loading classifier weights from {classifier_path}")
+            self.classifier.load_state_dict(torch.load(classifier_path, map_location=self.llama_model.device))
 
     def _setup_peft(self, ft_path, is_train_mode):
         try:
@@ -109,10 +111,10 @@ class LogSentinelModel(nn.Module):
         inputs_embeds = torch.cat([instruc_embeds, projected_batch], dim=1)
 
         attention_mask = torch.ones(inputs_embeds.shape[:2], device=self.device, dtype=torch.long)
-
-        outputs = self.llama_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
-
-        last_hidden_state = outputs.hidden_states[-1]
+        
+        base_model = getattr(self.llama_model, "model", self.llama_model)
+        outputs = base_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=False)
+        last_hidden_state = outputs.last_hidden_state
 
         sequence_lengths = attention_mask.sum(dim=1) - 1
         batch_indices = torch.arange(batch_size, device=last_hidden_state.device)

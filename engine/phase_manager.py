@@ -105,7 +105,9 @@ def train_phase(controller: 'TrainingController', phase_name, num_epochs, learni
 def evaluate(controller: 'TrainingController', dataset, dataset_name, epoch=-1):
     start_time = time.time()
     controller.model.eval()
-    loader = DataLoader(dataset, batch_size=controller.hp['micro_batch_size'] * 2, num_workers=controller.num_workers, pin_memory=True)
+    
+    eval_batch_size = controller.hp['micro_batch_size']
+    loader = DataLoader(dataset, batch_size=eval_batch_size, num_workers=controller.num_workers, pin_memory=True)
     all_preds, all_labels = [], []
 
     with torch.no_grad():
@@ -138,7 +140,8 @@ def evaluate_and_visualize(controller: 'TrainingController', dataset, dataset_na
 
     if controller.visualizer:
         try:
-            loader = DataLoader(dataset, batch_size=controller.hp['micro_batch_size'], shuffle=False, num_workers=controller.num_workers, pin_memory=True)
+            eval_batch_size = controller.hp['micro_batch_size']
+            loader = DataLoader(dataset, batch_size=eval_batch_size, shuffle=False, num_workers=controller.num_workers, pin_memory=True)
             all_labels, all_probs = [], []
             controller.model.eval()
             with torch.no_grad():
