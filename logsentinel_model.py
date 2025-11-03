@@ -112,8 +112,14 @@ class LogSentinelModel(nn.Module):
 
         attention_mask = torch.ones(inputs_embeds.shape[:2], device=self.device, dtype=torch.long)
         
-        base_model = getattr(self.llama_model, "model", self.llama_model)
-        outputs = base_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=False)
+        # Get the core transformer model, bypassing the CausalLM head
+        base_model = self.llama_model.model.model
+        
+        outputs = base_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask
+        )
+
         last_hidden_state = outputs.last_hidden_state
 
         sequence_lengths = attention_mask.sum(dim=1) - 1
