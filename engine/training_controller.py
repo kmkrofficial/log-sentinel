@@ -12,7 +12,6 @@ from pathlib import Path
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from datetime import datetime
-import tempfile
 
 from config import (
     EXECUTIONS_DIR, MODELS_DIR, DEFAULT_ENCODER_MODEL,
@@ -85,9 +84,10 @@ class TrainingController:
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
     def _load_and_tensorize_dataset(self, dataset_path, encoder_model, encoder_tokenizer, temp_dir, progress_start=0.0, progress_end=1.0):
-        self._log(f"Starting memory-safe embedding for {dataset_path.name}...")
+        self._log(f"Starting memory-safe embedding to disk for {dataset_path.name}...")
         
         embedding_chunk_size = self.hp['embedding_chunk_size']
+        SAVE_MICRO_CHUNK_SIZE = 2000
         
         try:
             total_chunks = sum(1 for _ in pd.read_csv(dataset_path, chunksize=embedding_chunk_size))
@@ -96,18 +96,16 @@ class TrainingController:
             return None
 
         chunk_files = []
+        micro_chunk_counter = 0
         with pd.read_csv(dataset_path, chunksize=embedding_chunk_size, dtype={'Content': str}) as reader:
             pbar = tqdm(reader, desc=f"Processing {dataset_path.name}", disable=self.is_gui_mode, unit=" chunks", total=total_chunks)
             for i, chunk_df in enumerate(pbar):
-                # --- START OF CHANGE: Granular progress reporting ---
                 if self.is_gui_mode:
                     local_progress = (i + 0.5) / total_chunks
                     global_progress = progress_start + (local_progress * (progress_end - progress_start))
-                    self.callback({"status": f"Embedding {dataset_path.name}: Processing chunk {i+1}/{total_chunks}", "progress": global_progress})
-                # --- END OF CHANGE ---
+                    self.callback({"status": f"Embedding {dataset_path.name}: Chunk {i+1}/{total_chunks}", "progress": global_progress})
 
-                if self.is_test_run:
-                    chunk_df = chunk_df.sample(frac=self.test_run_percentage, random_state=42)
+                if self.is_test_run: chunk_df = chunk_df.sample(frac=self.test_run_percentage, random_state=42)
 
                 chunk_df['Processed_Content'] = chunk_df['Content'].apply(replace_patterns)
                 sequences_in_chunk = [content.split(' ;-; ') for content in chunk_df['Processed_Content'].values]
@@ -116,12 +114,17 @@ class TrainingController:
                 
                 if not all_logs_flat: continue
 
+                # --- START OF FIX ---
+                # Reverted from a list comprehension to a standard for-loop to fix the NameError.
                 all_line_embeddings = []
                 for k in range(0, len(all_logs_flat), 512):
                     log_batch = all_logs_flat[k : k + 512]
                     with torch.no_grad():
                         inputs = encoder_tokenizer(log_batch, return_tensors="pt", padding=True, truncation=True, max_length=self.hp['max_content_len']).to(self.device)
-                        all_line_embeddings.append(self._mean_pooling(encoder_model(**inputs), inputs['attention_mask']).cpu())
+                        model_output = encoder_model(**inputs)
+                        embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
+                        all_line_embeddings.append(embeddings.cpu())
+                # --- END OF FIX ---
                 
                 if not all_line_embeddings: continue
                     
@@ -131,7 +134,7 @@ class TrainingController:
                 tensorized_sequences, tensorized_labels = [], []
                 max_seq_len, sample_embedding_dim = self.hp['max_seq_len'], all_line_embeddings_tensor.shape[1]
 
-                for seq_embeddings, seq_label in zip(chunk_embeddings, chunk_labels):
+                for seq_idx, (seq_embeddings, seq_label) in enumerate(zip(chunk_embeddings, chunk_labels)):
                     seq_len = seq_embeddings.shape[0]
                     if seq_len == 0:
                         tensorized_seq = torch.zeros(max_seq_len, sample_embedding_dim, dtype=torch.float32)
@@ -142,10 +145,18 @@ class TrainingController:
                     tensorized_sequences.append(tensorized_seq)
                     tensorized_labels.append(torch.tensor(seq_label, dtype=torch.long))
 
+                    if len(tensorized_sequences) >= SAVE_MICRO_CHUNK_SIZE:
+                        chunk_file = Path(temp_dir) / f"micro_chunk_{micro_chunk_counter}.pt"
+                        torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file, _use_new_zipfile_serialization=True)
+                        chunk_files.append(chunk_file)
+                        tensorized_sequences, tensorized_labels = [], []
+                        micro_chunk_counter += 1
+                
                 if tensorized_sequences:
-                    chunk_file = Path(temp_dir) / f"chunk_{i}.pt"
+                    chunk_file = Path(temp_dir) / f"micro_chunk_{micro_chunk_counter}.pt"
                     torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file, _use_new_zipfile_serialization=True)
                     chunk_files.append(chunk_file)
+                    micro_chunk_counter += 1
                 
                 del chunk_df, sequences_in_chunk, chunk_labels, all_logs_flat, all_line_embeddings, all_line_embeddings_tensor, chunk_embeddings
                 gc.collect()
@@ -186,14 +197,12 @@ class TrainingController:
             train_dataset_path = Path("datasets") / self.dataset_name / 'train.csv'
             test_dataset_path = Path("datasets") / self.dataset_name / 'test.csv'
 
-            # --- START OF CHANGE: Define progress budgets ---
             full_train_dataset = self._load_and_tensorize_dataset(train_dataset_path, encoder_model, encoder_tokenizer, temp_embedding_dir, progress_start=0.0, progress_end=0.45)
             
             if test_dataset_path.exists():
                 test_dataset = self._load_and_tensorize_dataset(test_dataset_path, encoder_model, encoder_tokenizer, temp_embedding_dir, progress_start=0.45, progress_end=0.5)
             else:
                 test_dataset = None
-            # --- END OF CHANGE ---
 
             self._log("Creating a 90/10 train/validation split from the training data.")
             train_size = int(0.9 * len(full_train_dataset))
@@ -221,7 +230,6 @@ class TrainingController:
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
             self.model = torch.compile(self.model, mode="max-autotune")
             
-            # --- START OF CHANGE: Pass progress budget to training phases ---
             self.model.set_train_projector_and_classifier()
             success, ft_path, duration = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, progress_state, progress_start=0.5, progress_end=0.75)
             total_training_time += duration
@@ -234,7 +242,6 @@ class TrainingController:
                 _, ft_path, duration = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, progress_state, progress_start=0.75, progress_end=1.0)
                 total_training_time += duration
                 self._cleanup()
-            # --- END OF CHANGE ---
 
             self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, False, self.device, self._log)

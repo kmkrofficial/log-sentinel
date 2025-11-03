@@ -55,6 +55,7 @@ class InferenceController:
     def _load_and_tensorize_dataset(self, dataset_path, encoder_model, encoder_tokenizer, temp_dir):
         self._log(f"Starting memory-safe embedding to disk for {dataset_path.name}...")
         embedding_chunk_size = self.hp['embedding_chunk_size']
+        SAVE_MICRO_CHUNK_SIZE = 2000
         
         try:
             total_chunks = sum(1 for _ in pd.read_csv(dataset_path, chunksize=embedding_chunk_size))
@@ -62,12 +63,11 @@ class InferenceController:
             self._log(f"Could not read dataset {dataset_path}: {e}")
             return None
 
-        chunk_files = []
+        chunk_files, micro_chunk_counter = [], 0
         with pd.read_csv(dataset_path, chunksize=embedding_chunk_size, dtype={'Content': str}) as reader:
             pbar = tqdm(reader, desc=f"Processing {dataset_path.name}", disable=self.is_gui_mode, unit=" chunks", total=total_chunks)
             for i, chunk_df in enumerate(pbar):
-                if self.is_test_run:
-                    chunk_df = chunk_df.sample(frac=self.test_run_percentage, random_state=42)
+                if self.is_test_run: chunk_df = chunk_df.sample(frac=self.test_run_percentage, random_state=42)
 
                 chunk_df['Processed_Content'] = chunk_df['Content'].apply(replace_patterns)
                 sequences_in_chunk = [content.split(' ;-; ') for content in chunk_df['Processed_Content'].values]
@@ -76,13 +76,17 @@ class InferenceController:
                 
                 if not all_logs_flat: continue
 
+                # --- START OF FIX ---
                 all_line_embeddings = []
                 for k in range(0, len(all_logs_flat), 512):
                     log_batch = all_logs_flat[k : k + 512]
                     with torch.no_grad():
                         inputs = encoder_tokenizer(log_batch, return_tensors="pt", padding=True, truncation=True, max_length=self.hp['max_content_len']).to(self.device)
-                        all_line_embeddings.append(self._mean_pooling(encoder_model(**inputs), inputs['attention_mask']).cpu())
-                
+                        model_output = encoder_model(**inputs)
+                        embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
+                        all_line_embeddings.append(embeddings.cpu())
+                # --- END OF FIX ---
+
                 if not all_line_embeddings: continue
                     
                 all_line_embeddings_tensor = torch.cat(all_line_embeddings, dim=0)
@@ -102,16 +106,18 @@ class InferenceController:
                     tensorized_sequences.append(tensorized_seq)
                     tensorized_labels.append(torch.tensor(seq_label, dtype=torch.long))
 
+                    if len(tensorized_sequences) >= SAVE_MICRO_CHUNK_SIZE:
+                        chunk_file = Path(temp_dir) / f"micro_chunk_{micro_chunk_counter}.pt"
+                        torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file, _use_new_zipfile_serialization=True)
+                        chunk_files.append(chunk_file)
+                        tensorized_sequences, tensorized_labels = [], []
+                        micro_chunk_counter += 1
+                
                 if tensorized_sequences:
-                    chunk_file = Path(temp_dir) / f"chunk_{i}.pt"
-                    # --- START OF FIX ---
-                    torch.save(
-                        (torch.stack(tensorized_sequences), torch.stack(tensorized_labels)),
-                        chunk_file,
-                        _use_new_zipfile_serialization=True
-                    )
-                    # --- END OF FIX ---
+                    chunk_file = Path(temp_dir) / f"micro_chunk_{micro_chunk_counter}.pt"
+                    torch.save((torch.stack(tensorized_sequences), torch.stack(tensorized_labels)), chunk_file, _use_new_zipfile_serialization=True)
                     chunk_files.append(chunk_file)
+                    micro_chunk_counter += 1
                 
                 del chunk_df, sequences_in_chunk, chunk_labels, all_logs_flat, all_line_embeddings, all_line_embeddings_tensor, chunk_embeddings
                 gc.collect()
