@@ -142,6 +142,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+node_modules/
+frontend/dist/
 
 # Spyder project settings
 .spyderproject
@@ -205,6 +207,7 @@ pyrightconfig.json
 
 /models
 /datasets
+/mlcore/datasets/
 /.model-new-env
 /ft_model_* 
 *.db
@@ -216,6 +219,11 @@ pyrightconfig.json
 /scripts_for_dev
 
 /executions
+/mlcore/models/
+/mlcore/executions/
+/mlcore/logsentinel_data/
+/backend/logsentinel_data/
+/backend/model_visualizations/
 project_snapshot.md
 /chart_gen.py
 /model_visualizations/
