@@ -1,5 +1,4 @@
 streamlit
-torch
 transformers
 peft
 bitsandbytes
@@ -8,10 +7,14 @@ pandas
 numpy
 scikit-learn
 psutil
-pynvml
+nvidia-ml-py
 matplotlib
 seaborn
 tqdm
 fpdf2
 onnx
 onnxruntime
+sentence-transformers
+py-cpuinfo
+wheel
+h5py

@@ -213,5 +213,10 @@ pyrightconfig.json
 *.rar
 *.whl
 /logsentinel_data
+/scripts_for_dev
 
+/executions
+project_snapshot.md
+/chart_gen.py
+/model_visualizations/
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks,visualstudiocode

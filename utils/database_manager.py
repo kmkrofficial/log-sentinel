@@ -1,135 +1,128 @@
 import sqlite3
 import json
-import time
+import pandas as pd
 from pathlib import Path
 
 class DatabaseManager:
-    def __init__(self, db_path='logsentinel.db'):
+    def __init__(self, db_path):
         self.db_path = Path(db_path)
-        self.conn = None
-        self._connect()
-        self._create_tables()
+        self._init_db()
 
-    def _connect(self):
-        try:
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self.conn.row_factory = sqlite3.Row
-        except sqlite3.Error as e:
-            print(f"Database connection error: {e}")
-            raise
+    def _get_conn(self):
+        return sqlite3.connect(self.db_path)
 
-    def _create_tables(self):
-        if not self.conn: return
-        cursor = self.conn.cursor()
-        try:
-            # --- FIX: Changed run_id to INTEGER and added nickname ---
-            cursor.execute("""
+    def _init_db(self):
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
             CREATE TABLE IF NOT EXISTS runs (
-                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                 nickname TEXT,
-                run_type TEXT NOT NULL,
-                start_time REAL NOT NULL,
-                end_time REAL,
-                status TEXT NOT NULL,
+                run_type TEXT,
                 model_name TEXT,
                 dataset_name TEXT,
-                report_path TEXT
-            );
-            """)
-            cursor.execute("CREATE TABLE IF NOT EXISTS hyperparameters (run_id INTEGER PRIMARY KEY, params_json TEXT NOT NULL, FOREIGN KEY (run_id) REFERENCES runs (run_id));")
-            cursor.execute("CREATE TABLE IF NOT EXISTS performance_metrics (run_id INTEGER PRIMARY KEY, metrics_json TEXT NOT NULL, FOREIGN KEY (run_id) REFERENCES runs (run_id));")
-            cursor.execute("CREATE TABLE IF NOT EXISTS resource_metrics (run_id INTEGER PRIMARY KEY, metrics_json TEXT NOT NULL, FOREIGN KEY (run_id) REFERENCES runs (run_id));")
-            self.conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error creating tables: {e}")
-        finally:
-            cursor.close()
-
-    def create_new_run(self, run_type, model_name, dataset_name, hyperparameters, nickname=None):
-        if not self.conn: return None
-        start_time = time.time()
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(
-                "INSERT INTO runs (nickname, run_type, start_time, status, model_name, dataset_name) VALUES (?, ?, ?, ?, ?, ?)",
-                (nickname, run_type, start_time, 'STARTED', model_name, dataset_name)
+                status TEXT DEFAULT 'PENDING',
+                report_path TEXT,
+                
+                total_run_time_sec REAL,
+                training_time_sec REAL,
+                testing_time_sec REAL,
+                
+                accuracy REAL,
+                precision REAL,
+                f1_score REAL,
+                recall REAL,
+                
+                avg_ram_usage_gb REAL,
+                peak_95_ram_usage_gb REAL,
+                avg_gpu_vram_gb REAL,
+                peak_95_gpu_vram_gb REAL,
+                
+                hyperparameters TEXT
             )
-            run_id = cursor.lastrowid
-            if hyperparameters:
-                cursor.execute("INSERT INTO hyperparameters (run_id, params_json) VALUES (?, ?)", (run_id, json.dumps(hyperparameters)))
-            self.conn.commit()
-            return run_id
-        except sqlite3.Error as e:
-            print(f"Error creating new run: {e}")
-            self.conn.rollback()
-            return None
-        finally:
-            cursor.close()
+            ''')
+            conn.commit()
 
-    def save_performance_metrics(self, run_id, metrics_dict):
-        if not self.conn or not run_id: return
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("INSERT OR REPLACE INTO performance_metrics (run_id, metrics_json) VALUES (?, ?)",(run_id, json.dumps(metrics_dict))); self.conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error saving performance metrics for run {run_id}: {e}"); self.conn.rollback()
-        finally: cursor.close()
-
-    def save_resource_metrics(self, run_id, resource_dict):
-        if not self.conn or not run_id: return
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("INSERT OR REPLACE INTO resource_metrics (run_id, metrics_json) VALUES (?, ?)", (run_id, json.dumps(resource_dict))); self.conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error saving resource metrics for run {run_id}: {e}"); self.conn.rollback()
-        finally: cursor.close()
+    def create_new_run(self, run_type, model_name, dataset_name, hyperparameters, nickname):
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            hp_json = json.dumps(hyperparameters)
+            cursor.execute('''
+            INSERT INTO runs (run_type, model_name, dataset_name, hyperparameters, nickname, status)
+            VALUES (?, ?, ?, ?, ?, 'RUNNING')
+            ''', (run_type, model_name, dataset_name, hp_json, nickname))
+            conn.commit()
+            return cursor.lastrowid
 
     def update_run_status(self, run_id, status, report_path=None):
-        if not self.conn or not run_id: return
-        end_time = time.time(); cursor = self.conn.cursor()
-        try:
-            if report_path: cursor.execute("UPDATE runs SET status = ?, end_time = ?, report_path = ? WHERE run_id = ?", (status, end_time, report_path, run_id))
-            else: cursor.execute("UPDATE runs SET status = ?, end_time = ? WHERE run_id = ?", (status, end_time, run_id))
-            self.conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error updating run status for {run_id}: {e}"); self.conn.rollback()
-        finally: cursor.close()
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+            UPDATE runs SET status = ?, report_path = ?
+            WHERE id = ?
+            ''', (status, report_path, run_id))
+            conn.commit()
 
-    def get_all_runs(self, run_type=None):
-        if not self.conn: return []
-        cursor = self.conn.cursor()
-        try:
-            query = "SELECT * FROM runs"
-            params = ()
-            if run_type:
-                query += " WHERE run_type = ?"
-                params = (run_type,)
-            query += " ORDER BY start_time DESC"
-            cursor.execute(query, params)
-            return [dict(run) for run in cursor.fetchall()]
-        except sqlite3.Error as e:
-            print(f"Error getting runs: {e}")
-            return []
-        finally:
-            cursor.close()
+    def save_final_metrics(self, run_id, metrics):
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+            UPDATE runs SET
+                total_run_time_sec = ?,
+                training_time_sec = ?,
+                testing_time_sec = ?,
+                accuracy = ?,
+                precision = ?,
+                f1_score = ?,
+                recall = ?,
+                avg_ram_usage_gb = ?,
+                peak_95_ram_usage_gb = ?,
+                avg_gpu_vram_gb = ?,
+                peak_95_gpu_vram_gb = ?
+            WHERE id = ?
+            ''', (
+                metrics.get('total_run_time_sec'),
+                metrics.get('training_time_sec'),
+                metrics.get('testing_time_sec'),
+                metrics.get('accuracy'),
+                metrics.get('precision'),
+                metrics.get('f1_score'),
+                metrics.get('recall'),
+                metrics.get('avg_ram_usage_gb'),
+                metrics.get('peak_95_ram_usage_gb'),
+                metrics.get('avg_gpu_vram_gb'),
+                metrics.get('peak_95_gpu_vram_gb'),
+                run_id
+            ))
+            conn.commit()
+
+    def get_all_runs(self):
+        with self._get_conn() as conn:
+            query = """
+                SELECT 
+                    id, start_time, nickname, dataset_name, status,
+                    total_run_time_sec, f1_score, precision, recall, accuracy
+                FROM runs 
+                ORDER BY start_time DESC
+            """
+            df = pd.read_sql_query(query, conn)
+            return df
 
     def get_run_details(self, run_id):
-        if not self.conn or not run_id: return None
-        details = {}; cursor = self.conn.cursor()
-        try:
-            cursor.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)); run_data = cursor.fetchone()
-            if not run_data: return None
-            details['run_info'] = dict(run_data)
-            cursor.execute("SELECT params_json FROM hyperparameters WHERE run_id = ?", (run_id,)); hp_data = cursor.fetchone()
-            details['hyperparameters'] = json.loads(hp_data['params_json']) if hp_data else {}
-            cursor.execute("SELECT metrics_json FROM performance_metrics WHERE run_id = ?", (run_id,)); perf_data = cursor.fetchone()
-            details['performance_metrics'] = json.loads(perf_data['metrics_json']) if perf_data else {}
-            cursor.execute("SELECT metrics_json FROM resource_metrics WHERE run_id = ?", (run_id,)); res_data = cursor.fetchone()
-            details['resource_metrics'] = json.loads(res_data['metrics_json']) if res_data else {}
-            return details
-        except sqlite3.Error as e:
-            print(f"Error getting details for run {run_id}: {e}"); return None
-        finally: cursor.close()
-    
-    def close(self):
-        if self.conn: self.conn.close(); self.conn = None
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            row = cursor.fetchone()
+            if row:
+                details = dict(row)
+                details['hyperparameters'] = json.loads(details.get('hyperparameters', '{}'))
+                return details
+            return None
+
+    def get_runs_by_nickname_prefix(self, prefix):
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT nickname FROM runs WHERE nickname LIKE ?", (f"{prefix}%",))
+            return [row[0] for row in cursor.fetchall()]
