@@ -160,3 +160,22 @@ def run_job(job_id: str, job_callable: Callable[[], None]) -> None:
             mark_job_complete(job_id)
     except Exception as exc:
         mark_job_failed(job_id, error=str(exc))
+
+
+def iter_active_jobs() -> list[dict[str, Any]]:
+    with _JOB_LOCK:
+        return [copy.deepcopy(job) for job in ACTIVE_JOBS.values()]
+
+
+def fail_unfinished_jobs(reason: str) -> list[dict[str, Any]]:
+    affected_jobs: list[dict[str, Any]] = []
+
+    for job in iter_active_jobs():
+        if job.get("done"):
+            continue
+
+        updated = mark_job_failed(job["job_id"], error=reason, status="FAILED")
+        if updated is not None:
+            affected_jobs.append(updated)
+
+    return affected_jobs

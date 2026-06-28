@@ -137,6 +137,26 @@ cd frontend
 npm run dev
 ```
 
+## Scripts
+
+The repository now includes a dedicated [scripts](scripts) folder for setup, deployment prep, and local execution management.
+
+- [scripts/setup.ps1](scripts/setup.ps1): verifies Python 3.11, creates or reuses `.venv`, verifies the virtual environment interpreter, lets you choose `frontend`, `mlcore`, `backend-mlcore`, or `all`, installs dependencies, and builds the frontend when requested.
+- [scripts/start.ps1](scripts/start.ps1): starts `backend`, `frontend`, or `all`.
+- [scripts/stop.ps1](scripts/stop.ps1): stops `backend`, `frontend`, or `all`.
+- [scripts/restart.ps1](scripts/restart.ps1): restarts `backend`, `frontend`, or `all`.
+
+Examples:
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+PowerShell -ExecutionPolicy Bypass -File .\scripts\start.ps1 all
+PowerShell -ExecutionPolicy Bypass -File .\scripts\stop.ps1 backend
+PowerShell -ExecutionPolicy Bypass -File .\scripts\restart.ps1 frontend
+```
+
+The scripts store local process state under `scripts/.runtime/`, which is ignored by Git.
+
 ## Current Frontend Surface
 
 - Dashboard view: lists historical runs from `GET /api/runs`.
@@ -161,3 +181,5 @@ The backend now owns SQLite persistence. `mlcore/` does not import the database 
 ## Operational Note
 
 `ACTIVE_JOBS` is currently in-memory inside the FastAPI process. Live job state will be lost if the backend process restarts. That matches the current refactor phase, but it is not a durable job queue.
+
+When the managed backend process is stopped through the scripts, any unfinished application-started jobs are marked `FAILED` during FastAPI shutdown. CLI-driven `mlcore` runs remain independent because they do not execute inside the backend process.

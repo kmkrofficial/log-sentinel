@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.job_manager import get_job
+from api.job_manager import fail_unfinished_jobs, get_job
 from api.routes.inference import router as inference_router
 from api.routes.metadata import router as metadata_router
 from api.routes.training import router as training_router
 from api.schemas import JobStatusResponse
+from config import DB_PATH
+from utils.database_manager import DatabaseManager
 
 
 app = FastAPI(title="Log Sentinel API")
@@ -21,6 +23,17 @@ app.add_middleware(
 app.include_router(metadata_router)
 app.include_router(training_router)
 app.include_router(inference_router)
+
+
+@app.on_event("shutdown")
+def handle_shutdown() -> None:
+    db_manager = DatabaseManager(DB_PATH)
+    reason = "Backend process stopped before the job finished."
+
+    for job in fail_unfinished_jobs(reason):
+        run_id = job.get("run_id")
+        if run_id is not None:
+            db_manager.update_run_status(run_id, "FAILED", None)
 
 
 @app.get("/api/status/{job_id}", response_model=JobStatusResponse)

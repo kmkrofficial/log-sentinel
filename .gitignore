@@ -224,6 +224,7 @@ pyrightconfig.json
 /mlcore/logsentinel_data/
 /backend/logsentinel_data/
 /backend/model_visualizations/
+/scripts/.runtime/
 project_snapshot.md
 /chart_gen.py
 /model_visualizations/
