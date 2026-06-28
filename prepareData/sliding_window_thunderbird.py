@@ -9,10 +9,10 @@ from helper import generate_logformat_regex, log_to_dataframe_generator
 # --- Configuration ---
 
 # 1. Source: The full path to the raw Thunderbird log file.
-SOURCE_LOG_FILE = "/home/koganrath/Personal/coding/loghub-logs/thunderbird/Thunderbird.log"
+SOURCE_LOG_FILE = r"D:\coding\datasets\Thunderbird\Thunderbird.log"
 
 # 2. Destination: The directory where the final train.csv, validation.csv, etc., will be saved.
-DESTINATION_DIRECTORY = "/home/koganrath/Personal/coding/log-sentinel/datasets/Thunderbird"
+DESTINATION_DIRECTORY = r"D:\coding\log-sentinel\datasets\Thunderbird"
 
 # 3. Slicing: Define the specific lines from the raw log file to process.
 START_LINE = 160000000

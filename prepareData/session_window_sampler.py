@@ -8,9 +8,9 @@ from tqdm import tqdm
 from helper import structure_log
 
 # --- Main Configuration ---
-data_dir = r'/home/koganrath/Personal/coding/loghub-logs/HDFS_v1'
+data_dir = r'D:\coding\datasets\HDFS_v1'
 log_name = "HDFS.log"
-output_dir = "/home/koganrath/Personal/coding/log-sentinel/datasets/HDFS_sampler"
+output_dir = r"D:\coding\log-sentinel\datasets\HDFS_sampler"
 
 # --- Sub-sampling Configuration ---
 # Set to True to create a smaller, chunked dataset for faster, local runs.

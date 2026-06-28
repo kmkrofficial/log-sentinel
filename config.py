@@ -1,5 +1,6 @@
 from pathlib import Path
 import psutil
+import platform
 
 ROOT_DIR = Path(__file__).resolve().parent
 
@@ -19,6 +20,8 @@ DEFAULT_ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B"
 
 def get_optimal_workers():
+    if platform.system() == "Windows":
+        return 0
     try:
         cpu_count = psutil.cpu_count(logical=True)
         return max(4, min(cpu_count // 2, 8))
@@ -26,8 +29,7 @@ def get_optimal_workers():
         return 4
 
 BASE_HYPERPARAMETERS = {
-    # --- NEW: Configurable chunk size for memory management ---
-    "embedding_chunk_size": 100000, # Default for most datasets
+    "embedding_chunk_size": 100000,
     "n_epochs_phase_adapters": 5,
     "lr_phase_adapters": 5e-5,
     "n_epochs_phase_full": 15,
@@ -54,7 +56,6 @@ DATASET_HYPERPARAMETERS = {
         "n_epochs_phase_full": 10,
     },
     "Thunderbird": {
-        # --- NEW: Drastically reduce chunk size to prevent RAM OOM ---
         "embedding_chunk_size": 20000,
         "min_less_portion": 0.3, "max_seq_len": 256, "early_stopping_patience": 4,
     },

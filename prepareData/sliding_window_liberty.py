@@ -7,9 +7,9 @@ import numpy as np
 # --- Script Configuration for Liberty Dataset ---
 
 # 1. Dataset Paths and Parameters
-data_dir = r'/home/koganrath/Personal/coding/loghub-logs/liberty'
+data_dir = r'D:\coding\datasets\liberty2'
 log_name = "liberty2"
-output_dir = data_dir
+output_dir = r'D:\coding\log-sentinel\datasets\Liberty'
 log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'
 
 # 2. Data Selection and Splitting Parameters

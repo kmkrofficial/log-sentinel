@@ -217,4 +217,6 @@ pyrightconfig.json
 
 /executions
 project_snapshot.md
+/chart_gen.py
+/model_visualizations/
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks,visualstudiocode

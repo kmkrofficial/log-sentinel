@@ -168,6 +168,7 @@ class TrainingController:
         total_training_time, total_testing_time = 0, 0
         final_model_metrics = {}
         embedding_root_dir = None
+        test_dataset = None
 
         try:
             if not self._initialize_run():
@@ -210,7 +211,11 @@ class TrainingController:
             ft_path = None
             
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
-            self.model = torch.compile(self.model, mode="max-autotune")
+            if platform.system() == "Linux":
+                self._log("Optimizing for Linux: Enabling torch.compile() for optimized performance.")
+                self.model = torch.compile(self.model, mode="max-autotune")
+            else:
+                self._log("Skipping torch.compile() on non-Linux system for compatibility.")
 
             self.model.set_train_projector_and_classifier()
             success, ft_path, duration = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, {}, progress_start=0.5, progress_end=0.75)
@@ -219,7 +224,12 @@ class TrainingController:
             if success:
                 self._cleanup()
                 self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
-                self.model = torch.compile(self.model, mode="max-autotune")
+                if platform.system() == "Linux":
+                    self._log("Optimizing for Linux: Enabling torch.compile() for optimized performance.")
+                    self.model = torch.compile(self.model, mode="max-autotune")
+                else:
+                    self._log("Skipping torch.compile() on non-Linux system for compatibility.")
+
                 self.model.set_finetuning_all()
                 _, ft_path, duration = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, {}, progress_start=0.75, progress_end=1.0)
                 total_training_time += duration
@@ -227,8 +237,12 @@ class TrainingController:
 
             self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, False, self.device, self._log)
-            self.model = torch.compile(self.model, mode="max-autotune")
-
+            if platform.system() == "Linux":
+                self._log("Optimizing for Linux: Enabling torch.compile() for optimized performance.")
+                self.model = torch.compile(self.model, mode="max-autotune")
+            else:
+                self._log("Skipping torch.compile() on non-Linux system for compatibility.")
+            
             if validation_dataset:
                 val_metrics, val_duration = evaluate_and_visualize(self, validation_dataset, "validation")
                 final_model_metrics.update(val_metrics['validation'])
