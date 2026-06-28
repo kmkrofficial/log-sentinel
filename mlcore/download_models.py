@@ -6,12 +6,15 @@ import sys
 
 hf_logging.set_verbosity_error()
 
-sys.path.append(str(Path(__file__).resolve().parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 try:
-    from config import MODELS_DIR, DEFAULT_ENCODER_MODEL, DEFAULT_LLAMA_MODEL
+    from mlcore.config import MODELS_DIR, DEFAULT_ENCODER_MODEL, DEFAULT_LLAMA_MODEL
 except ImportError:
     print("Error: Could not import config.py.")
-    print("Please make sure this script is in the root directory of your project.")
+    print("Please make sure this script is being run from the repository root or with the project on PYTHONPATH.")
     MODELS_DIR = Path(__file__).resolve().parent / 'models'
     DEFAULT_ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
     DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B"

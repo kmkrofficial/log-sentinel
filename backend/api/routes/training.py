@@ -9,6 +9,7 @@ from config import DB_PATH, EXECUTIONS_DIR
 from mlcore.config import DEFAULT_LLAMA_MODEL, get_hyperparameters
 from mlcore.engine.training_controller import TrainingController
 from utils.database_manager import DatabaseManager
+from utils.mlcore_validation import assert_required_models_present
 
 
 router = APIRouter(prefix="/api", tags=["training"])
@@ -76,6 +77,8 @@ def _run_training_job(job_id: str, run_id: int, nickname: str, request_payload: 
 
 @router.post("/train", response_model=JobStartedResponse, status_code=status.HTTP_202_ACCEPTED)
 def start_training_job(request: TrainRequest, background_tasks: BackgroundTasks) -> JobStartedResponse:
+    assert_required_models_present()
+
     job_id = uuid4().hex
     request_payload = request.model_dump()
     nickname = _generate_training_nickname(request.dataset_name, request.is_test_run, request.test_run_percentage)

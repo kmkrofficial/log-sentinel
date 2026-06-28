@@ -9,6 +9,7 @@ from config import DB_PATH, EXECUTIONS_DIR
 from mlcore.config import DEFAULT_LLAMA_MODEL, get_hyperparameters
 from mlcore.engine.inference_controller import InferenceController
 from utils.database_manager import DatabaseManager
+from utils.mlcore_validation import assert_required_models_present
 
 
 router = APIRouter(prefix="/api", tags=["inference"])
@@ -75,6 +76,8 @@ def _run_inference_job(job_id: str, run_id: int, nickname: str, request_payload:
 
 @router.post("/inference", response_model=JobStartedResponse, status_code=status.HTTP_202_ACCEPTED)
 def start_inference_job(request: InferenceRequest, background_tasks: BackgroundTasks) -> JobStartedResponse:
+    assert_required_models_present()
+
     job_id = uuid4().hex
     request_payload = request.model_dump()
     nickname = _generate_inference_nickname(

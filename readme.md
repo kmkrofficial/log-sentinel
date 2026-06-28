@@ -39,6 +39,8 @@ log-sentinel/
 
 Python 3.11 is recommended. GPU-backed training still depends on a CUDA-compatible PyTorch install and the model stack already used in this repository.
 
+The backend does not download models at runtime. It only validates that the required local model directories already exist under `mlcore/models` before it accepts training or inference work.
+
 1. Create and activate a virtual environment.
 
 ```bash
@@ -73,6 +75,8 @@ uvicorn api.main:app --reload
 ```
 
 The backend will be available at `http://localhost:8000`.
+
+If the required models are missing, training and inference endpoints return a validation error telling you to complete setup first.
 
 ## ML Core CLI
 
@@ -142,6 +146,7 @@ npm run dev
 The repository now includes a dedicated [scripts](scripts) folder for setup, deployment prep, and local execution management.
 
 - [scripts/setup.ps1](scripts/setup.ps1): verifies Python 3.11, creates or reuses `.venv`, verifies the virtual environment interpreter, lets you choose `frontend`, `mlcore`, `backend-mlcore`, or `all`, installs dependencies, and builds the frontend when requested.
+	It can also install the local Flash Attention wheel from `mlcore/` and optionally download the required Hugging Face models into `mlcore/models`.
 - [scripts/start.ps1](scripts/start.ps1): starts `backend`, `frontend`, or `all`.
 - [scripts/stop.ps1](scripts/stop.ps1): stops `backend`, `frontend`, or `all`.
 - [scripts/restart.ps1](scripts/restart.ps1): restarts `backend`, `frontend`, or `all`.
@@ -154,6 +159,19 @@ PowerShell -ExecutionPolicy Bypass -File .\scripts\start.ps1 all
 PowerShell -ExecutionPolicy Bypass -File .\scripts\stop.ps1 backend
 PowerShell -ExecutionPolicy Bypass -File .\scripts\restart.ps1 frontend
 ```
+
+To prepare the Python side and explicitly keep model downloads disabled during setup:
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Profile backend-mlcore
+```
+
+During `mlcore`, `backend-mlcore`, or `all` setup, the script can:
+
+- install the local Flash Attention wheel from `mlcore/flash_attn-2.8.2+cu128torch2.8-cp311-cp311-win_amd64.whl` when available
+- prompt for Hugging Face authentication and download the required models into `mlcore/models`
+
+That is the intended place for model provisioning. The frontend never provisions models, and the backend only validates their presence.
 
 The scripts store local process state under `scripts/.runtime/`, which is ignored by Git.
 
@@ -177,6 +195,7 @@ Key backend endpoints:
 - `GET /api/status/{job_id}`
 
 The backend now owns SQLite persistence. `mlcore/` does not import the database layer.
+The backend also does not provision models. It validates model presence before starting ML work.
 
 ## Operational Note
 
