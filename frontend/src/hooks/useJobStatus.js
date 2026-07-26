@@ -49,8 +49,18 @@ export default function useJobStatus(jobId) {
           return
         }
 
-        setError(pollError.response?.data?.detail ?? pollError.message ?? 'Unable to load job status.')
+        const responseStatus = pollError.response?.status
+        const message = responseStatus === 404
+          ? 'This job is no longer available. It may have been interrupted when the backend restarted.'
+          : (pollError.response?.data?.detail ?? pollError.message ?? 'Unable to load job status.')
+
+        setError(message)
         setLoading(false)
+
+        if (responseStatus === 404 && intervalId) {
+          window.clearInterval(intervalId)
+          intervalId = null
+        }
       }
     }
 

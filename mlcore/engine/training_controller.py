@@ -6,7 +6,6 @@ import time
 import shutil
 import pandas as pd
 import traceback
-import platform
 import numpy as np
 import h5py
 from tqdm import tqdm
@@ -23,6 +22,7 @@ from mlcore.utils.data_loader import replace_patterns
 from mlcore.utils.resource_monitor import ResourceMonitor
 from mlcore.logsentinel_model import LogSentinelModel
 from mlcore.utils.helpers import merge_data, get_eta, format_time
+from mlcore.utils.runtime_compat import maybe_compile_model
 from mlcore.engine.phase_manager import train_phase, evaluate_and_visualize
 from mlcore.engine.data_utils import BalancedSampler, HDF5Dataset
 
@@ -100,8 +100,8 @@ class TrainingController:
             json.dump(self._to_serializable(self.run_metrics), metrics_file, indent=2)
 
     def _cleanup(self, model_to_clean=None):
-        target = model_to_clean if model_to_clean else self.model
-        if target: del target
+        if model_to_clean is None or model_to_clean is self.model:
+            self.model = None
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
@@ -234,16 +234,12 @@ class TrainingController:
             train_dataset, validation_dataset = random_split(full_train_dataset, [train_size, validation_size])
 
             self._cleanup(model_to_clean=encoder_model)
-            del encoder_tokenizer
+            del encoder_model, encoder_tokenizer
 
             ft_path = None
             
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
-            if platform.system() == "Linux":
-                self._log("Optimizing for Linux: Enabling torch.compile() for optimized performance.")
-                self.model = torch.compile(self.model, mode="max-autotune")
-            else:
-                self._log("Skipping torch.compile() on non-Linux system for compatibility.")
+            self.model = maybe_compile_model(self.model, self._log)
 
             self.model.set_train_projector_and_classifier()
             success, ft_path, duration = train_phase(self, "Adapters", self.hp.get('n_epochs_phase_adapters', 0), self.hp.get('lr_phase_adapters', 5e-5), train_dataset, validation_dataset, {}, progress_start=0.5, progress_end=0.75)
@@ -252,11 +248,7 @@ class TrainingController:
             if success:
                 self._cleanup()
                 self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, True, self.device, self._log)
-                if platform.system() == "Linux":
-                    self._log("Optimizing for Linux: Enabling torch.compile() for optimized performance.")
-                    self.model = torch.compile(self.model, mode="max-autotune")
-                else:
-                    self._log("Skipping torch.compile() on non-Linux system for compatibility.")
+                self.model = maybe_compile_model(self.model, self._log)
 
                 self.model.set_finetuning_all()
                 _, ft_path, duration = train_phase(self, "Full_Fine_Tuning", self.hp.get('n_epochs_phase_full', 0), self.hp.get('lr_phase_full', 2e-5), train_dataset, validation_dataset, {}, progress_start=0.75, progress_end=1.0)
@@ -265,11 +257,7 @@ class TrainingController:
 
             self._log("\n>>>> CONFIGURING MODEL FOR FINAL EVALUATION <<<<")
             self.model = LogSentinelModel(self.llama_model_path, self.hp['encoder_hidden_size'], self.hp, ft_path, False, self.device, self._log)
-            if platform.system() == "Linux":
-                self._log("Optimizing for Linux: Enabling torch.compile() for optimized performance.")
-                self.model = torch.compile(self.model, mode="max-autotune")
-            else:
-                self._log("Skipping torch.compile() on non-Linux system for compatibility.")
+            self.model = maybe_compile_model(self.model, self._log)
             
             if validation_dataset:
                 val_metrics, val_duration = evaluate_and_visualize(self, validation_dataset, "validation")
@@ -318,7 +306,7 @@ class TrainingController:
                 "testing_time_sec": total_testing_time,
             }
 
-            if self.model: self._cleanup()
+            self._cleanup()
             self._emit_callback({
                 "status": final_status,
                 "progress": 1.0 if final_status == 'COMPLETED' else None,

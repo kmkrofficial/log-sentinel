@@ -1,48 +1,37 @@
 # Utils
 
-The `utils/` directory contains the shared infrastructure that the rest of LogSentinel depends on. These modules are deliberately not tied to one page or one controller. They exist to keep cross-cutting concerns isolated from the training and inference flow.
+`mlcore/utils/` contains the reusable support modules that the ML runtime depends on. These files do not own job orchestration, HTTP behavior, or frontend state. They exist to centralize lower-level concerns such as text normalization, model loading, telemetry capture, and small helper transforms so that the controllers and model code stay readable.
 
-This folder is the reason the rest of the codebase can stay relatively focused: controllers can orchestrate runs, pages can render UI, and the helper modules here take care of persistence, plotting, model loading, text normalization, and session state.
+## File Guide
 
-## Module Guide
-
-| File | Responsibility |
-| --- | --- |
-| `data_loader.py` | Normalizes raw log text with pattern replacement and defines a simple in-memory dataset abstraction. |
-| `database_manager.py` | Owns SQLite schema creation plus run creation, updates, and lookup queries. |
-| `global_state.py` | Wraps `st.session_state` so training and inference status survive Streamlit reruns. |
-| `helpers.py` | Lightweight utility functions for sequence flattening and time formatting. |
-| `log_visualizer.py` | Generates confusion matrices, ROC curves, PR curves, loss plots, and resource charts. |
-| `model_loader.py` | Loads the quantized Llama backbone and tokenizer with the repository's preferred inference and training settings. |
-| `resource_monitor.py` | Samples CPU, RAM, GPU utilization, VRAM, power, and clocks during a run. |
-| `ui_helpers.py` | Shared Streamlit rendering helpers and dataset-discovery logic. |
+| File | What it does | Why it exists |
+| --- | --- | --- |
+| `data_loader.py` | Normalizes raw log text with placeholder replacement and defines an in-memory dataset helper. | Keeps sequence preprocessing consistent across workflows. |
+| `helpers.py` | Provides utilities such as `merge_data()`, `format_time()`, and ETA calculation. | Prevents orchestration code from being cluttered with generic helper logic. |
+| `model_loader.py` | Loads the quantized Llama backbone and tokenizer with the repository's preferred settings. | Centralizes a fragile and hardware-sensitive model-loading path. |
+| `resource_monitor.py` | Samples CPU, RAM, GPU utilization, VRAM, power, and clocks in a background thread. | Makes runtime telemetry a first-class artifact rather than an afterthought. |
+| `__init__.py` | Package marker. | Allows the folder to be imported as a normal Python package. |
 
 ## Why These Concerns Live Here
 
-### Persistence is infrastructure, not workflow
-
-`database_manager.py` does not decide when a run should exist or what training means. It only offers the persistence contract. That keeps `engine/` free to focus on orchestration while the database layer stays simple and replaceable.
-
-### Model loading is centralized for consistency
-
-`model_loader.py` is one of the most important utilities in the project. It ensures the Llama backbone is always loaded with the same quantization and tokenizer rules. Without that centralization, training and inference could quietly diverge.
-
-### Monitoring and visualization are first-class features
-
-The project does not treat metrics and resource usage as debugging extras. `resource_monitor.py` and `log_visualizer.py` exist because comparing runs requires both model quality and hardware behavior. That is especially important for a workstation-oriented application that cares about VRAM constraints.
-
-### Streamlit state is intentionally wrapped
-
-Using `st.session_state` directly everywhere would make the page layer noisy and repetitive. `global_state.py` creates one place to manage status flags, queues, logs, and progress values, which makes the UI behavior easier to reason about.
-
 ### Text normalization is shared because it changes model behavior
 
-`data_loader.py` replaces volatile patterns such as IPs, paths, and booleans with placeholders. That preprocessing step is not cosmetic; it shapes the token distribution that both the encoder and downstream classifier see. Keeping it in a shared module guarantees the same normalization logic can be reused across workflows.
+`data_loader.py` replaces volatile structures such as IPs, file paths, and literal values with placeholders. That is not just cleanup. It changes the token distribution seen by the sentence encoder and ultimately the classifier, so the rule set needs one canonical home.
 
-## How `utils/` Supports The Architecture
+### Model loading needs one source of truth
 
-- `pages/` uses `global_state.py`, `ui_helpers.py`, and `database_manager.py` to stay small.
-- `engine/` uses `database_manager.py`, `resource_monitor.py`, `log_visualizer.py`, `helpers.py`, and `data_loader.py` to avoid reimplementing support code.
-- `logsentinel_model.py` depends on `model_loader.py` so the backbone setup is consistent everywhere.
+Quantized Llama loading is sensitive to tokenizer behavior, attention implementation, device mapping, and train-mode settings. `model_loader.py` exists so training and inference do not silently diverge.
 
-In effect, `utils/` is the stability layer of the repository. It absorbs the operational details so the domain logic can stay readable.
+### Resource monitoring belongs beside the ML runtime
+
+The backend stores summary telemetry in SQLite, but the measurements themselves are produced here because they are tightly coupled to the lifetime of a training or inference process.
+
+## What Is No Longer Here
+
+The older Streamlit layout stored UI state and database helpers in a `utils/` folder. In the current monorepo:
+
+- persistence moved to `backend/utils/`
+- UI state and rendering live in `frontend/src/`
+- ML-specific helpers remain here in `mlcore/utils/`
+
+That split is intentional and reflects the current separation between API, runtime, and browser concerns.

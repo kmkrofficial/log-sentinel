@@ -1,11 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.job_manager import fail_unfinished_jobs, get_job
+from api.job_manager import fail_unfinished_jobs, get_job, iter_active_jobs
+from api.routes.data_prep import router as data_prep_router
 from api.routes.inference import router as inference_router
 from api.routes.metadata import router as metadata_router
+from api.routes.precheck import router as precheck_router
+from api.routes.setup import router as setup_router
 from api.routes.training import router as training_router
-from api.schemas import JobStatusResponse
+from api.schemas import ActiveJobsResponse, JobStatusResponse
 from config import DB_PATH
 from utils.database_manager import DatabaseManager
 
@@ -23,6 +26,9 @@ app.add_middleware(
 app.include_router(metadata_router)
 app.include_router(training_router)
 app.include_router(inference_router)
+app.include_router(data_prep_router)
+app.include_router(precheck_router)
+app.include_router(setup_router)
 
 
 @app.on_event("shutdown")
@@ -36,12 +42,7 @@ def handle_shutdown() -> None:
             db_manager.update_run_status(run_id, "FAILED", None)
 
 
-@app.get("/api/status/{job_id}", response_model=JobStatusResponse)
-def get_job_status(job_id: str) -> JobStatusResponse:
-    job = get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-
+def _job_status_response(job: dict) -> JobStatusResponse:
     return JobStatusResponse(
         job_id=job["job_id"],
         job_type=job["job_type"],
@@ -55,3 +56,19 @@ def get_job_status(job_id: str) -> JobStatusResponse:
         run_id=job.get("run_id"),
         execution_dir=job.get("execution_dir"),
     )
+
+
+@app.get("/api/jobs/active", response_model=ActiveJobsResponse)
+def get_active_jobs() -> ActiveJobsResponse:
+    jobs = [job for job in iter_active_jobs() if not job.get("done")]
+    jobs.sort(key=lambda job: str(job.get("updated_at", "")), reverse=True)
+    return ActiveJobsResponse(jobs=[_job_status_response(job) for job in jobs])
+
+
+@app.get("/api/status/{job_id}", response_model=JobStatusResponse)
+def get_job_status(job_id: str) -> JobStatusResponse:
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    return _job_status_response(job)

@@ -1,12 +1,16 @@
-import { useEffect, useState } from 'react'
+import { useContext, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-import { fetchDatasets, submitTrainingJob } from '../services/api.js'
+import LiveJobPanel from '../components/LiveJobPanel.jsx'
+import PrecheckPanel from '../components/PrecheckPanel.jsx'
+import { JobContext } from '../context/JobContext.jsx'
+import { fetchDatasets, runPrecheck, submitTrainingJob } from '../services/api.js'
 
 const DEFAULT_HYPERPARAMETERS = '{\n  "micro_batch_size": 32,\n  "n_epochs_phase_adapters": 5\n}'
 
 export default function TrainPage() {
   const navigate = useNavigate()
+  const { activeTrainingJob, setActiveTrainingJob } = useContext(JobContext)
   const [datasets, setDatasets] = useState([])
   const [datasetName, setDatasetName] = useState('')
   const [hyperparametersText, setHyperparametersText] = useState(DEFAULT_HYPERPARAMETERS)
@@ -14,9 +18,16 @@ export default function TrainPage() {
   const [testRunPercentage, setTestRunPercentage] = useState('0.30')
   const [loadingDatasets, setLoadingDatasets] = useState(true)
   const [submitting, setSubmitting] = useState(false)
+  const [checkingPrecheck, setCheckingPrecheck] = useState(false)
+  const [precheckReport, setPrecheckReport] = useState(null)
   const [error, setError] = useState('')
 
   useEffect(() => {
+    if (activeTrainingJob) {
+      setLoadingDatasets(false)
+      return undefined
+    }
+
     const loadDatasets = async () => {
       try {
         setLoadingDatasets(true)
@@ -32,13 +43,46 @@ export default function TrainPage() {
     }
 
     loadDatasets()
-  }, [])
+    return undefined
+  }, [activeTrainingJob])
+
+  const resetPrecheck = () => {
+    setPrecheckReport(null)
+  }
+
+  const handleRunPrecheck = async () => {
+    if (!datasetName) {
+      setError('Select a dataset before running pre-checks.')
+      return
+    }
+
+    try {
+      setCheckingPrecheck(true)
+      setError('')
+      const report = await runPrecheck({
+        phase: 'training',
+        dataset_name: datasetName,
+        is_test_run: isTestRun,
+        test_run_percentage: Number(testRunPercentage),
+      })
+      setPrecheckReport(report)
+    } catch (precheckError) {
+      setError(precheckError.response?.data?.detail ?? precheckError.message ?? 'Unable to run training pre-checks.')
+    } finally {
+      setCheckingPrecheck(false)
+    }
+  }
 
   const handleSubmit = async (event) => {
     event.preventDefault()
 
     if (!datasetName) {
       setError('Select a dataset before launching a training run.')
+      return
+    }
+
+    if (!precheckReport?.ready) {
+      setError('Run pre-checks and resolve every failed requirement before starting training.')
       return
     }
 
@@ -63,12 +107,27 @@ export default function TrainPage() {
         test_run_percentage: Number(testRunPercentage),
       })
 
+      setActiveTrainingJob(payload.job_id)
       navigate(`/jobs/${payload.job_id}`)
     } catch (submitError) {
-      setError(submitError.response?.data?.detail ?? submitError.message ?? 'Unable to start training job.')
+      const detail = submitError.response?.data?.detail
+      if (detail?.precheck) {
+        setPrecheckReport(detail.precheck)
+      }
+      setError(typeof detail === 'string' ? detail : detail?.message ?? submitError.message ?? 'Unable to start training job.')
     } finally {
       setSubmitting(false)
     }
+  }
+
+  if (activeTrainingJob) {
+    return (
+      <LiveJobPanel
+        jobId={activeTrainingJob}
+        jobType="training"
+        onClear={() => setActiveTrainingJob(null)}
+      />
+    )
   }
 
   return (
@@ -102,7 +161,10 @@ export default function TrainPage() {
                 <select
                   id="datasetName"
                   value={datasetName}
-                  onChange={(event) => setDatasetName(event.target.value)}
+                  onChange={(event) => {
+                    setDatasetName(event.target.value)
+                    resetPrecheck()
+                  }}
                   disabled={loadingDatasets || submitting}
                 >
                   {datasets.map((dataset) => (
@@ -123,7 +185,10 @@ export default function TrainPage() {
                   max="1"
                   step="0.01"
                   value={testRunPercentage}
-                  onChange={(event) => setTestRunPercentage(event.target.value)}
+                  onChange={(event) => {
+                    setTestRunPercentage(event.target.value)
+                    resetPrecheck()
+                  }}
                   disabled={!isTestRun || submitting}
                 />
                 <div className="field-hint">Used only when quick test mode is enabled.</div>
@@ -137,7 +202,10 @@ export default function TrainPage() {
                   id="isTestRun"
                   type="checkbox"
                   checked={isTestRun}
-                  onChange={(event) => setIsTestRun(event.target.checked)}
+                  onChange={(event) => {
+                    setIsTestRun(event.target.checked)
+                    resetPrecheck()
+                  }}
                   disabled={submitting}
                 />
                 <span>Run a reduced quick-test job first</span>
@@ -149,14 +217,24 @@ export default function TrainPage() {
               <textarea
                 id="hyperparameters"
                 value={hyperparametersText}
-                onChange={(event) => setHyperparametersText(event.target.value)}
+                onChange={(event) => {
+                  setHyperparametersText(event.target.value)
+                  resetPrecheck()
+                }}
                 disabled={submitting}
               />
               <div className="field-hint">Only include overrides. The backend merges these into dataset defaults.</div>
             </div>
 
+            <PrecheckPanel
+              report={precheckReport}
+              checking={checkingPrecheck}
+              onRun={handleRunPrecheck}
+              disabled={submitting || loadingDatasets || !datasetName}
+            />
+
             <div className="panel-actions">
-              <button className="button primary" type="submit" disabled={submitting || loadingDatasets || !datasetName}>
+              <button className="button primary" type="submit" disabled={submitting || loadingDatasets || !precheckReport?.ready}>
                 {submitting ? 'Submitting…' : 'Launch training job'}
               </button>
             </div>

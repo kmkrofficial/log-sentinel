@@ -6,7 +6,6 @@ import time
 import shutil
 import pandas as pd
 import traceback
-import platform
 import numpy as np
 import h5py
 from tqdm import tqdm
@@ -23,6 +22,7 @@ from mlcore.config import (
 from mlcore.utils.data_loader import replace_patterns
 from mlcore.logsentinel_model import LogSentinelModel
 from mlcore.utils.helpers import merge_data, format_time
+from mlcore.utils.runtime_compat import maybe_compile_model
 from mlcore.engine.data_utils import HDF5Dataset
 from mlcore.utils.resource_monitor import ResourceMonitor
 
@@ -102,8 +102,8 @@ class InferenceController:
             json.dump(self._to_serializable(self.run_metrics), metrics_file, indent=2)
 
     def _cleanup(self, model_to_clean=None):
-        target = model_to_clean if model_to_clean else self.model
-        if target: del target
+        if model_to_clean is None or model_to_clean is self.model:
+            self.model = None
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
@@ -266,7 +266,7 @@ class InferenceController:
             self._embed_and_save_to_hdf5(dataset_path, h5_path, encoder_model, encoder_tokenizer, progress_start=0.0, progress_end=0.45)
             dataset = HDF5Dataset(h5_path)
             self._cleanup(model_to_clean=encoder_model)
-            del encoder_tokenizer
+            del encoder_model, encoder_tokenizer
 
             if not dataset: raise RuntimeError("Inference dataset could not be loaded.")
 
@@ -277,11 +277,7 @@ class InferenceController:
                 ft_path=str(self.model_run_path / 'output_model'), is_train_mode=False, device=self.device, log_callback=self._log
             )
             
-            if platform.system() == "Linux":
-                self._log("Optimizing for Linux: Enabling torch.compile() for optimized performance.")
-                self.model = torch.compile(self.model, mode="max-autotune")
-            else:
-                self._log("Skipping torch.compile() on non-Linux system for compatibility.")
+            self.model = maybe_compile_model(self.model, self._log)
 
             self._emit_callback({"status": "Running inference", "progress": 0.6})
             test_metrics, all_labels, all_preds, all_probs = self._evaluate_and_visualize(dataset, "test", progress_start=0.6, progress_end=0.95)

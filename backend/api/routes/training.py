@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 
 from api.job_manager import build_job_callback, initialize_job, run_job, update_job
 from api.schemas import JobStartedResponse, TrainRequest
@@ -9,7 +9,7 @@ from config import DB_PATH, EXECUTIONS_DIR
 from mlcore.config import DEFAULT_LLAMA_MODEL, get_hyperparameters
 from mlcore.engine.training_controller import TrainingController
 from utils.database_manager import DatabaseManager
-from utils.mlcore_validation import assert_required_models_present
+from utils.precheck import build_precheck_report
 
 
 router = APIRouter(prefix="/api", tags=["training"])
@@ -77,7 +77,17 @@ def _run_training_job(job_id: str, run_id: int, nickname: str, request_payload: 
 
 @router.post("/train", response_model=JobStartedResponse, status_code=status.HTTP_202_ACCEPTED)
 def start_training_job(request: TrainRequest, background_tasks: BackgroundTasks) -> JobStartedResponse:
-    assert_required_models_present()
+    precheck_report = build_precheck_report(
+        phase="training",
+        dataset_name=request.dataset_name,
+        is_test_run=request.is_test_run,
+        test_run_percentage=request.test_run_percentage,
+    )
+    if not precheck_report["ready"]:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"message": "Training pre-checks failed.", "precheck": precheck_report},
+        )
 
     job_id = uuid4().hex
     request_payload = request.model_dump()

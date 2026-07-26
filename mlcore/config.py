@@ -2,13 +2,14 @@ from pathlib import Path
 import psutil
 import platform
 
-ROOT_DIR = Path(__file__).resolve().parent
+MLCORE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = MLCORE_DIR.parent
 
 DATA_CACHE_DIR = ROOT_DIR / 'logsentinel_data'
 DATA_DIR = ROOT_DIR / 'datasets'
 MODELS_DIR = ROOT_DIR / 'models'
 EXECUTIONS_DIR = ROOT_DIR / 'executions'
-UTILS_DIR = ROOT_DIR / 'utils'
+UTILS_DIR = MLCORE_DIR / 'utils'
 
 TEMP_MODELS_DIR = DATA_CACHE_DIR / 'temp_models'
 
@@ -51,6 +52,10 @@ DATASET_HYPERPARAMETERS = {
         "n_epochs_phase_adapters": 5, "n_epochs_phase_full": 25, "early_stopping_patience": 5,
     },
     "HDFS": {
+        "min_less_portion": 0.3, "max_seq_len": 128, "n_epochs_phase_adapters": 3,
+        "n_epochs_phase_full": 10,
+    },
+    "HDFS_v1": {
         "min_less_portion": 0.3, "max_seq_len": 128, "n_epochs_phase_adapters": 3,
         "n_epochs_phase_full": 10,
     },

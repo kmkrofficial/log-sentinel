@@ -1,6 +1,6 @@
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DatasetListResponse(BaseModel):
@@ -48,6 +48,64 @@ class InferenceRequest(BaseModel):
     manual_nickname: str | None = None
 
 
+class DataPrepRequest(BaseModel):
+    dataset_name: str
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class DataPrepStatusResponse(BaseModel):
+    datasets: list[dict[str, Any]]
+
+
+class SetupCheckItem(BaseModel):
+    key: str
+    label: str
+    status: Literal["passed", "warning", "failed"]
+    detail: str
+
+
+class SetupProvisionRequest(BaseModel):
+    datasets: list[str] = []
+    models: list[str] = []
+    force: bool = False
+
+    class Response(BaseModel):
+        job_id: str
+        status: str
+
+
+class SetupStatusResponse(BaseModel):
+    checked_at: str
+    hf_token_configured: bool
+    downloads_path: str
+    datasets: list[dict[str, Any]]
+    models: list[dict[str, Any]]
+    storage: dict[str, Any]
+    runtime_checks: list[SetupCheckItem]
+
+
+class PreCheckRequest(BaseModel):
+    phase: Literal["training", "inference"]
+    dataset_name: str
+    model_run_path: str | None = None
+    is_test_run: bool = False
+    test_run_percentage: float = 0.3
+
+
+class PreCheckItem(BaseModel):
+    key: str
+    label: str
+    status: Literal["passed", "warning", "failed"]
+    detail: str
+
+
+class PreCheckResponse(BaseModel):
+    phase: Literal["training", "inference"]
+    ready: bool
+    checked_at: str
+    checks: list[PreCheckItem]
+
+
 class JobStartedResponse(BaseModel):
     job_id: str
     status: str
@@ -65,6 +123,10 @@ class JobStatusResponse(BaseModel):
     validation_metrics: dict[str, Any] | None = None
     run_id: int | None = None
     execution_dir: str | None = None
+
+
+class ActiveJobsResponse(BaseModel):
+    jobs: list[JobStatusResponse]
 
 
 class SyncRunsResponse(BaseModel):

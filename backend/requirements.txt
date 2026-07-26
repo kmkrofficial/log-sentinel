@@ -15,11 +15,7 @@ sentence-transformers
 py-cpuinfo
 wheel
 h5py
-<<<<<<< HEAD:backend/requirements.txt
 fastapi
 uvicorn
 pydantic
-=======
 huggingface-hub
-transformers[torch]
->>>>>>> 577fdd4 (docs: readme for indivdual folders):requirements.txt

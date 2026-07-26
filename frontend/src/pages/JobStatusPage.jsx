@@ -1,11 +1,9 @@
 import { Link, useParams } from 'react-router-dom'
 
 import LiveJobPanel from '../components/LiveJobPanel.jsx'
-import useJobStatus from '../hooks/useJobStatus.js'
 
 export default function JobStatusPage() {
   const { jobId } = useParams()
-  const { job, loading, error } = useJobStatus(jobId)
 
   return (
     <div className="page-grid">
@@ -25,7 +23,7 @@ export default function JobStatusPage() {
         </div>
       </section>
 
-      <LiveJobPanel job={job} loading={loading} error={error} />
+      <LiveJobPanel jobId={jobId} />
     </div>
   )
 }

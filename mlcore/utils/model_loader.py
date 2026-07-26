@@ -1,4 +1,8 @@
 import torch
+from mlcore.utils.runtime_compat import configure_bitsandbytes_cuda
+
+configure_bitsandbytes_cuda(torch.version.cuda)
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import os
 
@@ -23,7 +27,7 @@ def load_model_and_tokenizer(model_path, is_train_mode, progress_callback=None):
         device_map={"": 0},
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2"
+        attn_implementation="flash_attention_3"
     )
 
     model.config.use_cache = False

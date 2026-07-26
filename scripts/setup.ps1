@@ -2,7 +2,9 @@ param(
     [ValidateSet('frontend', 'mlcore', 'backend-mlcore', 'all')]
     [string]$Profile,
     [switch]$InstallFlashAttention,
-    [switch]$DownloadModels
+    [switch]$DownloadModels,
+    [switch]$DownloadDatasets,
+    [switch]$ForceProvision
 )
 
 Set-StrictMode -Version Latest
@@ -154,70 +156,77 @@ function Get-HuggingFaceCliPath {
     return $null
 }
 
-function Ensure-HuggingFaceLogin {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$VenvPython
-    )
-
-    $loginCheck = & $VenvPython -c "from huggingface_hub import HfApi; HfApi().whoami(); print('ok')" 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host 'Verified Hugging Face authentication.'
-        return
-    }
-
-    Write-Host 'Hugging Face authentication is required to download gated models such as Llama-3.2-1B.'
-    Write-Host 'If you do not have access yet, request access on Hugging Face before continuing.'
-
-    $cliPath = Get-HuggingFaceCliPath
-    if (-not $cliPath) {
-        Write-Host 'huggingface-cli was not found. Install it into the virtual environment with: python -m pip install "huggingface_hub[cli]"'
-        throw 'Hugging Face CLI is unavailable for login.'
-    }
-
-    Write-Host 'Launching huggingface-cli login...'
-    & $cliPath login
-    if ($LASTEXITCODE -ne 0) {
-        throw 'huggingface-cli login failed.'
-    }
-
-    $loginCheck = & $VenvPython -c "from huggingface_hub import HfApi; HfApi().whoami(); print('ok')" 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Hugging Face authentication could not be verified after login.'
-    }
-}
-
 function Install-FlashAttentionWheel {
     param(
         [Parameter(Mandatory = $true)]
         [string]$VenvPython
     )
 
-    $wheelPath = Join-Path (Get-RepoRoot) 'mlcore\flash_attn-2.8.2+cu128torch2.8-cp311-cp311-win_amd64.whl'
-    if (-not (Test-Path $wheelPath)) {
-        Write-Host "Flash Attention wheel was not found at $wheelPath. Skipping wheel install."
+    $wheelPath = Get-ChildItem -Path (Join-Path (Get-RepoRoot) 'mlcore') -Filter 'flash_attn_3-*.whl' -File |
+        Sort-Object Name -Descending |
+        Select-Object -First 1
+
+    if (-not $wheelPath) {
+        Write-Host 'A local FlashAttention 3 wheel was not found in mlcore. Skipping wheel install.'
         return
     }
 
-    Write-Host "Installing Flash Attention wheel from $wheelPath..."
-    & $VenvPython -m pip install --force-reinstall $wheelPath
+    Write-Host "Installing FlashAttention 3 wheel from $($wheelPath.FullName)..."
+    & $VenvPython -m pip install --force-reinstall $wheelPath.FullName
+}
+
+function Invoke-BootstrapProvision {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VenvPython,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $repoRoot = Get-RepoRoot
+    $bootstrapPath = Join-Path $repoRoot 'scripts\bootstrap.py'
+    if (-not (Test-Path $bootstrapPath)) {
+        throw "Bootstrap script was not found at $bootstrapPath."
+    }
+
+    Push-Location $repoRoot
+    try {
+        & $VenvPython $bootstrapPath @Arguments
+    } finally {
+        Pop-Location
+    }
 }
 
 function Download-HuggingFaceModels {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$VenvPython
+        [string]$VenvPython,
+        [switch]$Force
     )
 
-    Ensure-HuggingFaceLogin -VenvPython $VenvPython
-    $repoRoot = Get-RepoRoot
-    Write-Host 'Downloading required Hugging Face models into mlcore/models...'
-    Push-Location $repoRoot
-    try {
-        & $VenvPython -m mlcore.download_models
-    } finally {
-        Pop-Location
+    if (-not $env:HF_TOKEN) {
+        throw 'HF_TOKEN must be configured in the backend environment before downloading the gated Llama model.'
     }
+
+    $arguments = @('--models')
+    if ($Force) {
+        $arguments += '--force'
+    }
+    Invoke-BootstrapProvision -VenvPython $VenvPython -Arguments $arguments
+}
+
+function Download-LogDatasets {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VenvPython,
+        [switch]$Force
+    )
+
+    $arguments = @('--datasets', 'all')
+    if ($Force) {
+        $arguments += '--force'
+    }
+    Invoke-BootstrapProvision -VenvPython $VenvPython -Arguments $arguments
 }
 
 function Install-AndBuild-Frontend {
@@ -246,7 +255,11 @@ if (-not $PSBoundParameters.ContainsKey('InstallFlashAttention') -and $shouldIns
 }
 
 if (-not $PSBoundParameters.ContainsKey('DownloadModels') -and $selectedProfile -in @('mlcore', 'backend-mlcore', 'all')) {
-    $DownloadModels = Get-YesNoChoice -Prompt 'Download the required Hugging Face models during setup?' -Default $false
+    $DownloadModels = Get-YesNoChoice -Prompt 'Download the required models using the server HF_TOKEN during setup?' -Default $false
+}
+
+if (-not $PSBoundParameters.ContainsKey('DownloadDatasets') -and $selectedProfile -in @('mlcore', 'backend-mlcore', 'all')) {
+    $DownloadDatasets = Get-YesNoChoice -Prompt 'Download and checksum-verify all supported Zenodo datasets during setup?' -Default $false
 }
 
 switch ($selectedProfile) {
@@ -259,7 +272,10 @@ switch ($selectedProfile) {
             Install-FlashAttentionWheel -VenvPython $venvPython
         }
         if ($DownloadModels) {
-            Download-HuggingFaceModels -VenvPython $venvPython
+            Download-HuggingFaceModels -VenvPython $venvPython -Force:$ForceProvision
+        }
+        if ($DownloadDatasets) {
+            Download-LogDatasets -VenvPython $venvPython -Force:$ForceProvision
         }
     }
     'backend-mlcore' {
@@ -268,7 +284,10 @@ switch ($selectedProfile) {
             Install-FlashAttentionWheel -VenvPython $venvPython
         }
         if ($DownloadModels) {
-            Download-HuggingFaceModels -VenvPython $venvPython
+            Download-HuggingFaceModels -VenvPython $venvPython -Force:$ForceProvision
+        }
+        if ($DownloadDatasets) {
+            Download-LogDatasets -VenvPython $venvPython -Force:$ForceProvision
         }
     }
     'all' {
@@ -277,7 +296,10 @@ switch ($selectedProfile) {
             Install-FlashAttentionWheel -VenvPython $venvPython
         }
         if ($DownloadModels) {
-            Download-HuggingFaceModels -VenvPython $venvPython
+            Download-HuggingFaceModels -VenvPython $venvPython -Force:$ForceProvision
+        }
+        if ($DownloadDatasets) {
+            Download-LogDatasets -VenvPython $venvPython -Force:$ForceProvision
         }
         Install-AndBuild-Frontend
     }

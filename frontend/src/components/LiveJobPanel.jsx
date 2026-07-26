@@ -1,9 +1,21 @@
-import { Link } from 'react-router-dom'
+import { useContext } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
 
+import { JobContext } from '../context/JobContext.jsx'
+import useJobStatus from '../hooks/useJobStatus.js'
 import StatusBadge from './StatusBadge.jsx'
 
 function formatPercent(value) {
   return Number.isFinite(Number(value)) ? `${Number(value).toFixed(0)}%` : '0%'
+}
+
+const TERMINAL_STATUSES = new Set(['completed', 'failed'])
+
+const START_PATHS = {
+  setup: '/run?step=setup',
+  training: '/train',
+  inference: '/inference',
+  prep: '/data-prep',
 }
 
 function MetricList({ validationMetrics }) {
@@ -23,7 +35,81 @@ function MetricList({ validationMetrics }) {
   )
 }
 
-export default function LiveJobPanel({ job, loading, error }) {
+function getJobCategory(job, jobId, activeSetupJob, activeTrainingJob, activeInferenceJob, activePrepJob) {
+  const jobType = String(job?.job_type ?? '').toLowerCase()
+
+  if (jobType.includes('setup')) {
+    return 'setup'
+  }
+  if (jobType.includes('train')) {
+    return 'training'
+  }
+  if (jobType.includes('infer')) {
+    return 'inference'
+  }
+  if (jobType.includes('prep')) {
+    return 'prep'
+  }
+  if (jobId === activeSetupJob) {
+    return 'setup'
+  }
+  if (jobId === activeTrainingJob) {
+    return 'training'
+  }
+  if (jobId === activeInferenceJob) {
+    return 'inference'
+  }
+  if (jobId === activePrepJob) {
+    return 'prep'
+  }
+
+  return null
+}
+
+export default function LiveJobPanel({ jobId, jobType = null, onClear }) {
+  const navigate = useNavigate()
+  const {
+    activeSetupJob,
+    setActiveSetupJob,
+    activeTrainingJob,
+    setActiveTrainingJob,
+    activeInferenceJob,
+    setActiveInferenceJob,
+    activePrepJob,
+    setActivePrepJob,
+  } = useContext(JobContext)
+  const { job, loading, error } = useJobStatus(jobId)
+
+  const jobCategory = jobType ?? getJobCategory(
+    job,
+    jobId,
+    activeSetupJob,
+    activeTrainingJob,
+    activeInferenceJob,
+    activePrepJob,
+  )
+  const normalizedStatus = String(job?.status ?? '').toLowerCase()
+  const isTerminal = Boolean(job?.done) || TERMINAL_STATUSES.has(normalizedStatus)
+
+  const clearJobAndStartNew = () => {
+    if (onClear) {
+      onClear()
+      return
+    }
+
+    if (jobCategory === 'setup' && activeSetupJob === jobId) {
+      setActiveSetupJob(null)
+    } else if (jobCategory === 'training' && activeTrainingJob === jobId) {
+      setActiveTrainingJob(null)
+    } else if (jobCategory === 'inference' && activeInferenceJob === jobId) {
+      setActiveInferenceJob(null)
+    } else if (jobCategory === 'prep' && activePrepJob === jobId) {
+      setActivePrepJob(null)
+    }
+
+    navigate(START_PATHS[jobCategory] ?? '/')
+  }
+
   if (loading && !job) {
     return (
       <section className="panel">
@@ -38,7 +124,16 @@ export default function LiveJobPanel({ job, loading, error }) {
   }
 
   if (error && !job) {
-    return <div className="error-banner">{error}</div>
+    return (
+      <div className="page-grid">
+        <div className="error-banner">{error}</div>
+        <div className="panel-actions">
+          <button className="button primary" type="button" onClick={clearJobAndStartNew}>
+            Clear Job and Start New
+          </button>
+        </div>
+      </div>
+    )
   }
 
   const logs = job?.latest_logs ?? []
@@ -80,13 +175,18 @@ export default function LiveJobPanel({ job, loading, error }) {
 
         <MetricList validationMetrics={job.validation_metrics} />
 
-        {job.run_id ? (
-          <div className="panel-actions" style={{ marginTop: '1rem' }}>
-            <Link className="button primary" to={`/runs/${job.run_id}`}>
+        <div className="panel-actions" style={{ marginTop: '1rem' }}>
+          {job.run_id ? (
+            <Link className="button secondary" to={`/runs/${job.run_id}`}>
               Open completed run
             </Link>
-          </div>
-        ) : null}
+          ) : null}
+          {isTerminal ? (
+            <button className="button primary" type="button" onClick={clearJobAndStartNew}>
+              Clear Job and Start New
+            </button>
+          ) : null}
+        </div>
 
         <div className="log-stream" aria-live="polite">
           {logs.length ? (
